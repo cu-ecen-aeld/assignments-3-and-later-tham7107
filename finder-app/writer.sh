@@ -19,6 +19,15 @@ fi
 # For clarity in script, use descriptive variable names
 writefile=$1
 writestr=$2
+destdir=`dirname $writefile`
+
+# Create destination dir if it doesn't exist, exit on error
+mkdir -p $destdir
+
+if [ $? -ne 0 ]; then
+    echo "Error creating $destdir"
+    exit 1
+fi
 
 echo $writestr > $writefile
 
