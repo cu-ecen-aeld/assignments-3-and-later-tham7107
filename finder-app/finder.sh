@@ -25,8 +25,8 @@ if [ ! -d $filesdir ]; then
 fi
 
 # Search in dir and all subdirs; use find for recursion
-filecount=`find $filedir -type f | wc -l`
-matchcount=`find $filedir -type f -exec grep $searchstr {} \; | wc -l`
+filecount=`find $filesdir -type f | wc -l`
+matchcount=`find $filesdir -type f -exec grep $searchstr {} \; | wc -l`
 
 echo The number of files are $filecount and the number of matching lines are $matchcount
 exit 0
