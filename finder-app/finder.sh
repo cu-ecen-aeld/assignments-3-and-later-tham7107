@@ -29,3 +29,4 @@ filecount=`find $filedir -type f | wc -l`
 matchcount=`find $filedir -type f -exec grep $searchstr {} \; | wc -l`
 
 echo The number of files are $filecount and the number of matching lines are $matchcount
+exit 0
