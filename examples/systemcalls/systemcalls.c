@@ -16,8 +16,10 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
-
-    return true;
+  if (cmd && !system(cmd))
+    return true;		/* cmd != NULL and return == 0 */
+  else
+    return false;
 }
 
 /**
@@ -40,6 +42,9 @@ bool do_exec(int count, ...)
     va_start(args, count);
     char * command[count+1];
     int i;
+    pid_t child_pid;
+    int wstatus;
+
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
@@ -47,7 +52,7 @@ bool do_exec(int count, ...)
     command[count] = NULL;
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    //command[count] = command[count];
 
 /*
  * TODO:
@@ -58,7 +63,34 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    /* On failure, fork returns -1 */
+    if (-1 == (child_pid = fork())) {
+      perror("fork");
+      va_end(args);
+      return false;
+    }
 
+    /* If fork succeeds, child_pid is non-zero in parent, 0 in child */
+    if (child_pid) {
+      /* in parent - check retval of wait */
+      if (-1 == wait(&wstatus)) {
+	perror("wait");
+	va_end(args);
+	return false;
+      }
+      /* Check for non-zero exit status of cmd */
+      if (WIFEXITED(wstatus) && WEXITSTATUS(wstatus)) {
+	va_end(args);
+	return false;
+      }
+    } else {
+      /* in child - run command[0], entire array is argv */
+      if (-1 == execv(command[0],command)) {
+	perror("execv");
+	exit(EXIT_FAILURE);
+      }
+      /* no else, execv doesn't return if sucessful */
+    }
     va_end(args);
 
     return true;
@@ -75,6 +107,10 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     va_start(args, count);
     char * command[count+1];
     int i;
+    pid_t child_pid;
+    int wstatus;
+    int new_stdout;
+
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
@@ -82,7 +118,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     command[count] = NULL;
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    //command[count] = command[count];
 
 
 /*
@@ -92,7 +128,49 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+    /* On failure, fork returns -1 */
+    if (-1 == (child_pid = fork())) {
+      perror("fork");
+      va_end(args);
+      return false;
+    }
 
+    /* If fork succeeds, child_pid is non-zero in parent, 0 in child */
+    if (child_pid) {
+      /* in parent - check retval of wait */
+      if (-1 == wait(&wstatus)) {
+	perror("wait");
+	va_end(args);
+	return false;
+      }
+      /* Check for non-zero exit status of cmd */
+      if (WIFEXITED(wstatus) && WEXITSTATUS(wstatus)) {
+	va_end(args);
+	return false;
+      }
+    } else {
+      /* in child - open outputfile for writing */
+      if (-1 == (new_stdout = open(outputfile, O_CREAT | O_TRUNC | O_RDWR,
+				   S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH))) {
+	perror("open outputfile");
+	exit(EXIT_FAILURE);
+      }
+
+      /* dup2 to stdout */
+      if (-1 == dup2(new_stdout, 1)) {
+	perror("dup2");
+	exit(EXIT_FAILURE);
+      }
+
+      close(new_stdout);	/* Cleanup - close original fd */
+
+      /* run command[0], entire array is argv */
+      if (-1 == execv(command[0],command)) {
+	perror("execv");
+	exit(EXIT_FAILURE);
+      }
+      /* no else, execv doesn't return if sucessful */
+    }
     va_end(args);
 
     return true;
