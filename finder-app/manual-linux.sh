@@ -49,6 +49,7 @@ if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
 fi
 
 echo "Adding the Image in outdir"
+cp ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ${OUTDIR}
 
 echo "Creating the staging directory for the root filesystem"
 cd "$OUTDIR"
@@ -109,22 +110,32 @@ cp ${LIBC_BASE_DIR}/lib64/libc.so.6 ${OUTDIR}/rootfs/lib64
 # Lecture "Linux root filesystems", slide 16
 cd ${OUTDIR}/rootfs
 sudo mknod -m 666 dev/null c 1 3
-sudo mknod -m 600 dev/null c 5 1
+sudo mknod -m 600 dev/console c 5 1
 
 # TODO: Clean and build the writer utility
+cd ${FINDER_APP_DIR}
+make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} clean all
 
 # TODO: Copy the finder related scripts and executables to the /home directory
 # on the target rootfs
+# FINDER_APP_DIR set at top of script
+cd ${FINDER_APP_DIR}
+cp writer ${OUTDIR}/rootfs/home
+cp finder.sh ${OUTDIR}/rootfs/home
+cp finder-test.sh ${OUTDIR}/rootfs/home
+cp autorun-qemu.sh ${OUTDIR}/rootfs/home
+mkdir ${OUTDIR}/rootfs/home/conf
+cp conf/username.txt ${OUTDIR}/rootfs/home/conf
 
 # TODO: Chown the root directory
 # Lecture "Linux root filesystems", slide 17
 cd ${OUTDIR}/rootfs
 # May need to chown rootfs dir as well?
-sudo chown -r root:root *
+sudo chown -R root:root *
 
 # TODO: Create initramfs.cpio.gz
 # Lecture "Linux root filesystems", slide 19
 cd ${OUTDIR}/rootfs
-find . | cpio -H newc -ov --owner root:root > cd ${OUTDIR}/initramfs.cpio
+find . | cpio -H newc -ov --owner root:root > ${OUTDIR}/initramfs.cpio
 cd ${OUTDIR}
 gzip -f initramfs.cpio
