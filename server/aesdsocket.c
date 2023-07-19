@@ -5,9 +5,6 @@
 // July 2023
 //
 
-//#include <sys/stat.h>
-//#include <fcntl.h>
-
 #include <stdio.h>
 #include <stddef.h>
 #include <signal.h>
@@ -17,6 +14,8 @@
 #include <sys/select.h>
 #include <syslog.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <errno.h>
@@ -143,8 +142,9 @@ int wait_for_client_connection(int sock_fd, char *client_ip_addr_str,
 	if (EINTR == errno) {
 	    // System call, log message and exit cleanly.  Safe to exit,
 	    // since there isn't a connection to clean up yet.
-	    PRINTF("Caught signal, exiting\n");
+	    PRINTF("Caught signal in accept, exiting\n");
 	    close(sock_fd);
+	    unlink(DATAFILE);
 	    syslog(LOG_USER|LOG_INFO,"Caught signal, exiting");
 	    exit(EXIT_SUCCESS);
 	} else {
@@ -173,16 +173,40 @@ int wait_for_client_connection(int sock_fd, char *client_ip_addr_str,
     return(conn_fd);
 }
 
+// Close fd's, free memory and exit cleanly.  Move replicated code
+// out of main loop here.
+void shutdown_and_exit(int conn_fd, int sock_fd, char *buf, int exit_code)
+{
+    if (conn_fd) {
+	shutdown(conn_fd, SHUT_RDWR);
+	close(conn_fd);
+    }
+    if (sock_fd) {
+	close(sock_fd);
+    }
+    // Don't really need to test buf; null is a nop
+    if (buf) {
+	free(buf);
+    }
+    exit(exit_code);
+}
+
 int main(int argc, char *argv[])
 {
-    int sock_fd, conn_fd;
+    int file_fd, sock_fd, conn_fd;
     int client_done;
     char client_ip_addr_str[IP_ADDR_MAX_STRLEN];
     char client_port_str[IP_ADDR_MAX_STRLEN];
-    int ret_val = EXIT_SUCCESS;
     char *buf_start, *buf_curr;
     int cur_buf_size;
     int bytes_read;
+    int newline_idx;
+
+    if (-1 == (file_fd = open(DATAFILE, O_CREAT | O_APPEND | O_TRUNC | O_RDWR,
+			      S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH))) {
+	perror("open");
+	exit(EXIT_FAILURE);
+    }
 
     // Connect SIGINT and SIGTERM - perror and exit's on failure
     setup_signals();
@@ -193,7 +217,7 @@ int main(int argc, char *argv[])
 
     // Only support one client connection at a time.  Could fork and
     // create a child process to handle simultaneous clients.
-    while (EXIT_FAILURE != ret_val) {
+    while (1) {
 	client_done = 0;
 	conn_fd = wait_for_client_connection(sock_fd, client_ip_addr_str,
 					     client_port_str);
@@ -204,25 +228,30 @@ int main(int argc, char *argv[])
 	cur_buf_size = SOCK_READ_BUF_SIZE;
 	if (!(buf_curr = (buf_start = malloc(cur_buf_size)))) {
 	    perror("malloc");
-	    shutdown(conn_fd, SHUT_RDWR);
-	    close(conn_fd);
-	    ret_val = EXIT_FAILURE;
+	    shutdown_and_exit(conn_fd, sock_fd, NULL, EXIT_FAILURE);
 	}
-	while (!client_done && (EXIT_FAILURE != ret_val)) {
+	while (!client_done) {
 	    // Number of bytes read is length of string (with
 	    // newline), but no null terminator is added.
 	    bytes_read = recv(conn_fd, buf_curr, SOCK_READ_BUF_SIZE, 0);
 	    if (-1 >= bytes_read) {
-		// -1 on error
-		perror("recv");
-		shutdown(conn_fd, SHUT_RDWR);
-		close(conn_fd);
-		ret_val = EXIT_FAILURE;
+		// -1 on error - if recv was interrupted by signal, exit
+		if (EINTR == errno) {
+		    PRINTF("Caught signal in recv, exiting\n");
+		    unlink(DATAFILE);
+		    syslog(LOG_USER|LOG_INFO,"Caught signal, exiting");
+		    shutdown_and_exit(conn_fd, sock_fd, buf_start, EXIT_SUCCESS);
+		} else {
+		    // Other error - exit with failure
+		    perror("recv");
+		    shutdown_and_exit(conn_fd, sock_fd, buf_start, EXIT_FAILURE);
+		}
 	    } else if (0 == bytes_read) {
 		// 0 on remote connection closed
+		client_done = 1;
 		shutdown(conn_fd, SHUT_RDWR);
 		close(conn_fd);
-		client_done = 1;
+		free(buf_start);
 		PRINTF("Closed connection from %s:%s\n", client_ip_addr_str,
 		       client_port_str);
 		syslog(LOG_USER|LOG_INFO, "Closed connection from %s",
@@ -233,28 +262,72 @@ int main(int argc, char *argv[])
 		cur_buf_size += SOCK_READ_BUF_SIZE;
 		if (!(buf_start = realloc(buf_start, cur_buf_size))) {
 		    perror("realloc");
-		    shutdown(conn_fd, SHUT_RDWR);
-		    close(conn_fd);
-		    ret_val = EXIT_FAILURE;
+		    // Realloc free'd old buffer, nothing to free now
+		    shutdown_and_exit(conn_fd, sock_fd, NULL, EXIT_FAILURE);
 		}
-		// Realloc can (will) move the buffer.  Calculate new
-		// read destination as new buffer start plus current
-		// size, then back up one read block size.
+		// Realloc can move the buffer.  Calculate new read
+		// destination as new buffer start plus current size,
+		// then back up one read block size.
 		buf_curr = buf_start + cur_buf_size - SOCK_READ_BUF_SIZE;
 	    } else {
 		// Read < SOCK_READ_BUF_SIZE and > 0.  We've read all
-		// of the client data.  Null terminate the string,
+		// of the client data.  Null terminate the string
 		// write to the output file, and return the whole file
 		buf_curr[bytes_read] = 0;
 		PRINTF("length = %ld\n",strlen(buf_start));
+		// Find the first newline, start at byte 0
+		newline_idx = 0;
+		while ((newline_idx < strlen(buf_start)) &&
+		       ('\n' != buf_start[newline_idx])) {
+		    newline_idx++;
+		}
+		PRINTF("newline found at offset %d\n", newline_idx);
+		// Since search is 0-based, number of characters (including
+		// newline) is newline_idx + 1
+		newline_idx++;
+		// Write up to (and including) newline to output file.
+		if (-1 == write(file_fd, buf_start, newline_idx)) {
+		    perror("write");
+		    shutdown_and_exit(conn_fd, sock_fd, buf_start,
+				      EXIT_FAILURE);
+		}
+		//
+		// Now read the entire file and send it back to the client
+		//
+		// Reset the buffer size and pointers
+		cur_buf_size = SOCK_READ_BUF_SIZE;
+		if (!(buf_curr = (buf_start = realloc(buf_start,
+						      cur_buf_size)))) {
+		    perror("realloc");
+		    shutdown_and_exit(conn_fd, sock_fd, NULL, EXIT_FAILURE);
+		}
+		// Reset file pointer to start.  Should return 0 (requested
+		// set point).  Non-zero is an error (either -1 for error
+		// or some positive number if seek ends elsewhere.
+		// Since the file is opened with O_APPEND, writes atomically
+		// set the file pointer to the end before the write.
+		if (lseek(file_fd, 0, SEEK_SET)) {
+		    perror("lseek");
+		    shutdown_and_exit(conn_fd, sock_fd, buf_start,
+				      EXIT_FAILURE);
+		}
+	        while ((bytes_read = read(file_fd, buf_start, cur_buf_size))) {
+		    if (-1 == bytes_read) {
+			perror("read");
+			shutdown_and_exit(conn_fd, sock_fd, buf_start,
+					  EXIT_FAILURE);
+		    }
+		    PRINTF("bytes_read = %d\n",bytes_read);
+		    // Ignore partial writes.  Shouldn't happen...
+		    if (write(conn_fd, buf_start, bytes_read) != bytes_read) {
+			perror("write");
+			shutdown_and_exit(conn_fd, sock_fd, buf_start,
+					  EXIT_FAILURE);
+		    }
+		}
 	    }
 	}
     }
-
-    free(buf_start);		// Nop if NULL
-    shutdown(conn_fd, SHUT_RDWR);
-    close(conn_fd);
-    close(sock_fd);
-
-    return(ret_val);
+    // Never get here
+    return(0);
 }
