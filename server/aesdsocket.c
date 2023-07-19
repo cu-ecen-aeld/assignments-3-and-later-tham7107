@@ -221,6 +221,7 @@ int main(int argc, char *argv[])
     // socket, call getopts to look for -d.
     // See: https://www.gnu.org/software/libc/manual/html_node/Example-of-Getopt.html
     opterr = 0;			// Turn off getopt printfs
+    daemonize = 0;		// Assume not until we find -d in argv
     while ((arg = getopt (argc, argv, "d")) != -1)
 	switch (arg)
 	{
