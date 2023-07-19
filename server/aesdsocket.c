@@ -21,7 +21,8 @@
 #include <errno.h>
 #include <string.h>
 
-#define DEBUG 1
+//#define DEBUG 1
+#undef DEBUG
 
 #define TCP_PORT "9000"
 #define SOCKET_LISTEN_BACKLOG 5
@@ -194,6 +195,7 @@ void shutdown_and_exit(int conn_fd, int sock_fd, char *buf, int exit_code)
 int main(int argc, char *argv[])
 {
     int file_fd, sock_fd, conn_fd;
+    int arg, daemonize;
     int client_done;
     char client_ip_addr_str[IP_ADDR_MAX_STRLEN];
     char client_port_str[IP_ADDR_MAX_STRLEN];
@@ -214,6 +216,36 @@ int main(int argc, char *argv[])
     // Set up the socket with socket, bind, listen calls
     // perror and exit's on failure.  If we return, sock_fd is valid
     sock_fd = socket_init();
+
+    // Now that we have successfully determined that we can bind to the
+    // socket, call getopts to look for -d.
+    // See: https://www.gnu.org/software/libc/manual/html_node/Example-of-Getopt.html
+    opterr = 0;			// Turn off getopt printfs
+    while ((arg = getopt (argc, argv, "d")) != -1)
+	switch (arg)
+	{
+	case 'd':
+	    daemonize = 1;
+	    break;
+	// Ignore unknown opts and errors
+	case '?':
+	default:
+	    break;
+	}
+
+    if (daemonize) {
+	PRINTF("Daemonize...\n");
+	// daemon(3) handles fork/setsid/chdir/redir of stdin/out/err to
+	// /dev/null.  It does not close other open fd's (our sockets
+	// or /var/tmp/aesdsocketdata).  Does not return in parent.
+	if (-1 == daemon(0, 0))  // chdir /, dup2 stdin/out/err
+	{
+	    // Error - very very unlikely - system is whacked
+	    perror("daemon");
+	    exit(EXIT_FAILURE);
+	}
+	// Now running in child...
+    }
 
     // Only support one client connection at a time.  Could fork and
     // create a child process to handle simultaneous clients.
