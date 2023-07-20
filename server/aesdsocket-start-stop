@@ -9,6 +9,7 @@ case "$1" in
 	start-stop-daemon -S -n aesdsocket -a /usr/bin/aesdsocket -- -d
 	;;
     stop)
+	# Sends SIGTERM by default (what we want)
 	echo "Stopping aesdsocket"
 	start-stop-daemon -K -n aesdsocket
 	;;
