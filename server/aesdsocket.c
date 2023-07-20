@@ -5,6 +5,8 @@
 // July 2023
 //
 
+#define _GNU_SOURCE		// To get strchrnul
+
 #include <stdio.h>
 #include <stddef.h>
 #include <signal.h>
@@ -27,7 +29,7 @@
 #define TCP_PORT "9000"
 #define SOCKET_LISTEN_BACKLOG 5
 #define IP_ADDR_MAX_STRLEN 20
-#define SOCK_READ_BUF_SIZE 100
+#define SOCK_READ_BUF_SIZE 1000
 #define DATAFILE "/var/tmp/aesdsocketdata"
 
 #ifdef DEBUG
@@ -174,8 +176,9 @@ int wait_for_client_connection(int sock_fd, char *client_ip_addr_str,
     return(conn_fd);
 }
 
-// Close fd's, free memory and exit cleanly.  Move replicated code
-// out of main loop here.
+// Close fd's, free memory, delete tmp file, and exit cleanly.  Move
+// replicated code out of main loop here.  Ignore return values of
+// system calls; we're exiting anyway.
 void shutdown_and_exit(int conn_fd, int sock_fd, char *buf, int exit_code)
 {
     if (conn_fd) {
@@ -185,10 +188,11 @@ void shutdown_and_exit(int conn_fd, int sock_fd, char *buf, int exit_code)
     if (sock_fd) {
 	close(sock_fd);
     }
-    // Don't really need to test buf; null is a nop
+    // Don't really need to test buf; free(NULL) is a nop
     if (buf) {
 	free(buf);
     }
+    unlink(DATAFILE);
     exit(exit_code);
 }
 
@@ -202,7 +206,7 @@ int main(int argc, char *argv[])
     char *buf_start, *buf_curr;
     int cur_buf_size;
     int bytes_read;
-    int newline_idx;
+    char *newline_ptr;
 
     if (-1 == (file_fd = open(DATAFILE, O_CREAT | O_APPEND | O_TRUNC | O_RDWR,
 			      S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH))) {
@@ -264,6 +268,16 @@ int main(int argc, char *argv[])
 	    shutdown_and_exit(conn_fd, sock_fd, NULL, EXIT_FAILURE);
 	}
 	while (!client_done) {
+	    // In all likelihood, we will catch the SIGINT/SIGTERM in accept
+	    // or recv, since we will spend most of our time blocked in either
+	    // accept or recv, and the signal handler will never get called
+	    // (in all my testing, that is what happened).  HOWEVER, when
+	    // running the full_test.sh script, sometimes the signal to
+	    // shutdown the test happens outside of accept/recv.  This check
+	    // catches those cases.
+	    if (caught_signal) {
+		shutdown_and_exit(conn_fd, sock_fd, buf_start, EXIT_SUCCESS);
+	    }
 	    // Number of bytes read is length of string (with
 	    // newline), but no null terminator is added.
 	    bytes_read = recv(conn_fd, buf_curr, SOCK_READ_BUF_SIZE, 0);
@@ -271,7 +285,6 @@ int main(int argc, char *argv[])
 		// -1 on error - if recv was interrupted by signal, exit
 		if (EINTR == errno) {
 		    PRINTF("Caught signal in recv, exiting\n");
-		    unlink(DATAFILE);
 		    syslog(LOG_USER|LOG_INFO,"Caught signal, exiting");
 		    shutdown_and_exit(conn_fd, sock_fd, buf_start, EXIT_SUCCESS);
 		} else {
@@ -304,22 +317,28 @@ int main(int argc, char *argv[])
 		buf_curr = buf_start + cur_buf_size - SOCK_READ_BUF_SIZE;
 	    } else {
 		// Read < SOCK_READ_BUF_SIZE and > 0.  We've read all
-		// of the client data.  Null terminate the string
+		// of the client data.  Null terminate the string,
 		// write to the output file, and return the whole file
 		buf_curr[bytes_read] = 0;
 		PRINTF("length = %ld\n",strlen(buf_start));
-		// Find the first newline, start at byte 0
-		newline_idx = 0;
-		while ((newline_idx < strlen(buf_start)) &&
-		       ('\n' != buf_start[newline_idx])) {
-		    newline_idx++;
+		// Find the first newline, start at byte 0.  If no newline,
+		// use the null at the end.
+		newline_ptr = strchrnul(buf_start,'\n');
+		PRINTF("strchr found newline at offset %d\n", newline_ptr -
+		       buf_start);
+		// Write up to (but NOT including) the newline (or '\0')
+		// pointed to by newline_ptr.  Ignore partial writes (fs full)
+		if (-1 == write(file_fd, buf_start, newline_ptr - buf_start)) {
+		    perror("write");
+		    shutdown_and_exit(conn_fd, sock_fd, buf_start,
+				      EXIT_FAILURE);
 		}
-		PRINTF("newline found at offset %d\n", newline_idx);
-		// Since search is 0-based, number of characters (including
-		// newline) is newline_idx + 1
-		newline_idx++;
-		// Write up to (and including) newline to output file.
-		if (-1 == write(file_fd, buf_start, newline_idx)) {
+		// Now write out a trailing newline.  Done separately instead
+		// of writing +1 above, in case we didn't get a newline in the
+		// received packet (which shouldn't happen, since the
+		// assignment says we always get newline
+		buf_start[0] = '\n';
+		if (-1 == write(file_fd, buf_start, 1)) {
 		    perror("write");
 		    shutdown_and_exit(conn_fd, sock_fd, buf_start,
 				      EXIT_FAILURE);
