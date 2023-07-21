@@ -88,7 +88,7 @@ int socket_init()
 
     // Init the hints struct
     bzero(&getaddrinfo_hints, sizeof(struct addrinfo));
-    getaddrinfo_hints.ai_family   = AF_UNSPEC;   // IPv4 or v6
+    getaddrinfo_hints.ai_family   = AF_INET;	 // IPv4
     getaddrinfo_hints.ai_socktype = SOCK_STREAM; // TCP
     getaddrinfo_hints.ai_flags    = AI_PASSIVE;
 
