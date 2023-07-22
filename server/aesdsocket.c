@@ -22,9 +22,10 @@
 #include <netdb.h>
 #include <errno.h>
 #include <string.h>
+#include <pthread.h>
 
-//#define DEBUG 1
-#undef DEBUG
+#define DEBUG 1
+//#undef DEBUG
 
 #define TCP_PORT "9000"
 #define SOCKET_LISTEN_BACKLOG 5
@@ -37,6 +38,21 @@
 #else
 #define PRINTF(...)
 #endif
+
+struct thread_data {
+    // - Malloc thread struct, add to linked list.  Thread struct
+    //   contains: done flag, file_fd, shared mutex to protect writes
+    //   to file, and a the conn_fd returned above.
+    pthread_mutex_t *p_file_mutex;
+    int file_fd;
+    int conn_fd;
+    // get rid of sock_fd. threads should not call cleaup routine directly
+    int sock_fd;
+
+    int client_done;
+    char client_ip_addr_str[IP_ADDR_MAX_STRLEN];
+    char client_port_str[IP_ADDR_MAX_STRLEN];
+};
 
 int caught_signal = 0;
 
@@ -196,17 +212,145 @@ void shutdown_and_exit(int conn_fd, int sock_fd, char *buf, int exit_code)
     exit(exit_code);
 }
 
-int main(int argc, char *argv[])
+void *client_thread(void *arg)
 {
-    int file_fd, sock_fd, conn_fd;
-    int arg, daemonize;
-    int client_done;
-    char client_ip_addr_str[IP_ADDR_MAX_STRLEN];
-    char client_port_str[IP_ADDR_MAX_STRLEN];
+    struct thread_data *p_thread_data = (struct thread_data *)arg;
+    sigset_t signal_set;
     char *buf_start, *buf_curr;
     int cur_buf_size;
     int bytes_read;
     char *newline_ptr;
+
+    // Block SIGINT and SIGTERM - let main thread handle them.
+    sigemptyset(&signal_set);
+    sigaddset(&signal_set, SIGINT);
+    sigaddset(&signal_set, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &signal_set, NULL)) {
+	perror("pthread_sigmask");
+	pthread_exit(p_thread_data);
+    }
+
+    cur_buf_size = SOCK_READ_BUF_SIZE;
+    if (!(buf_curr = (buf_start = malloc(cur_buf_size)))) {
+	perror("malloc");
+	pthread_exit(p_thread_data);
+    }
+
+    while (!p_thread_data->client_done) {
+	bytes_read = recv(p_thread_data->conn_fd, buf_curr, SOCK_READ_BUF_SIZE, 0);
+	if (-1 >= bytes_read) {
+	    // -1 on error
+	    perror("recv");
+	    free(buf_start);
+	    pthread_exit(p_thread_data);
+	} else if (0 == bytes_read) {
+	    // 0 on remote connection closed
+	    p_thread_data->client_done = 1;
+	    free(buf_start);
+	    PRINTF("Closed connection from %s:%s\n", p_thread_data->client_ip_addr_str,
+		   p_thread_data->client_port_str);
+	    syslog(LOG_USER|LOG_INFO, "Closed connection from %s",
+		   p_thread_data->client_ip_addr_str);
+	    pthread_exit(p_thread_data);
+	} else if (SOCK_READ_BUF_SIZE == bytes_read) {
+	    // If the recv filled the buffer, there may be more data
+	    // waiting.  Enlarge the buffer and read some more.
+	    cur_buf_size += SOCK_READ_BUF_SIZE;
+	    if (!(buf_start = realloc(buf_start, cur_buf_size))) {
+		perror("realloc");
+		// Realloc free'd old buffer, nothing to free now
+		pthread_exit(p_thread_data);
+	    }
+	    // Realloc can move the buffer.  Calculate new read
+	    // destination as new buffer start plus current size,
+	    // then back up one read block size.
+	    buf_curr = buf_start + cur_buf_size - SOCK_READ_BUF_SIZE;
+	} else {
+	    // Read < SOCK_READ_BUF_SIZE and > 0.  We've read all
+	    // of the client data.  Null terminate the string,
+	    // write to the output file, and return the whole file
+	    buf_curr[bytes_read] = 0;
+	    PRINTF("length = %ld\n",strlen(buf_start));
+	    // Find the first newline, start at byte 0.  If no newline,
+	    // use the null at the end.
+	    newline_ptr = strchrnul(buf_start,'\n');
+	    PRINTF("strchr found newline at offset %ld\n", newline_ptr -
+		   buf_start);
+
+	    // Lock mutex around file i/o - can we unlock before read?
+	    if (pthread_mutex_lock(p_thread_data->p_file_mutex)) {
+		perror("pthread_mutex_lock");
+		pthread_exit(p_thread_data);		
+	    }
+	    
+	    // Write up to (but NOT including) the newline (or '\0')
+	    // pointed to by newline_ptr.  Ignore partial writes (fs full)
+	    if (-1 == write(p_thread_data->file_fd, buf_start, newline_ptr - buf_start)) {
+		perror("write");
+		pthread_exit(p_thread_data);		
+	    }
+	    // Now write out a trailing newline.  Done separately instead
+	    // of writing +1 above, in case we didn't get a newline in the
+	    // received packet (which shouldn't happen, since the
+	    // assignment says we always get newline
+	    buf_start[0] = '\n';
+	    if (-1 == write(p_thread_data->file_fd, buf_start, 1)) {
+		perror("write");
+		shutdown_and_exit(p_thread_data->conn_fd, p_thread_data->sock_fd, buf_start,
+				  EXIT_FAILURE);
+	    }
+	    //
+	    // Now read the entire file and send it back to the client
+	    //
+	    // Reset the buffer size and pointers
+	    cur_buf_size = SOCK_READ_BUF_SIZE;
+	    if (!(buf_curr = (buf_start = realloc(buf_start,
+						  cur_buf_size)))) {
+		perror("realloc");
+		shutdown_and_exit(p_thread_data->conn_fd, p_thread_data->sock_fd, NULL, EXIT_FAILURE);
+	    }
+	    // Reset file pointer to start.  Should return 0 (requested
+	    // set point).  Non-zero is an error (either -1 for error
+	    // or some positive number if seek ends elsewhere.
+	    // Since the file is opened with O_APPEND, writes atomically
+	    // set the file pointer to the end before the write.
+	    if (lseek(p_thread_data->file_fd, 0, SEEK_SET)) {
+		perror("lseek");
+		shutdown_and_exit(p_thread_data->conn_fd, p_thread_data->sock_fd, buf_start,
+				  EXIT_FAILURE);
+	    }
+	    while ((bytes_read = read(p_thread_data->file_fd, buf_start, cur_buf_size))) {
+		if (-1 == bytes_read) {
+		    perror("read");
+		    shutdown_and_exit(p_thread_data->conn_fd, p_thread_data->sock_fd, buf_start,
+				      EXIT_FAILURE);
+		}
+		PRINTF("bytes_read = %d\n",bytes_read);
+		// Ignore partial writes.  Shouldn't happen...
+		if (write(p_thread_data->conn_fd, buf_start, bytes_read) != bytes_read) {
+		    perror("write");
+		    shutdown_and_exit(p_thread_data->conn_fd, p_thread_data->sock_fd, buf_start,
+				      EXIT_FAILURE);
+		}
+	    }
+	    // Lock mutex around file i/o - can we unlock before read?
+	    if (pthread_mutex_unlock(p_thread_data->p_file_mutex)) {
+		perror("pthread_mutex_unlock");
+		pthread_exit(p_thread_data);		
+	    }
+	}
+    }
+    return arg;
+}
+
+int main(int argc, char *argv[])
+{
+    int file_fd, sock_fd, conn_fd;
+    int arg, daemonize;
+    pthread_mutex_t datafile_mutex;
+    struct thread_data *p_thread_data;
+    char client_ip_addr_str[IP_ADDR_MAX_STRLEN];
+    char client_port_str[IP_ADDR_MAX_STRLEN];
 
     if (-1 == (file_fd = open(DATAFILE, O_CREAT | O_APPEND | O_TRUNC | O_RDWR,
 			      S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH))) {
@@ -252,133 +396,60 @@ int main(int argc, char *argv[])
 	// Now running in child...
     }
 
+    if (pthread_mutex_init(&datafile_mutex, NULL)) {
+	perror("pthread_mutex_init");
+	exit(EXIT_FAILURE);
+    }
     // Only support one client connection at a time.  Could fork and
     // create a child process to handle simultaneous clients.
     while (1) {
-	client_done = 0;
 	conn_fd = wait_for_client_connection(sock_fd, client_ip_addr_str,
 					     client_port_str);
+
+	if (!(p_thread_data = malloc(sizeof(struct thread_data)))) {
+	    perror("malloc");
+	    shutdown_and_exit(conn_fd, sock_fd, NULL, EXIT_FAILURE);
+	}
+
+	p_thread_data->p_file_mutex = &datafile_mutex;
+	p_thread_data->file_fd      = file_fd;
+	p_thread_data->conn_fd      = conn_fd;
+	p_thread_data->sock_fd      = sock_fd;
+	p_thread_data->client_done  = 0;
+	strcpy(p_thread_data->client_ip_addr_str, client_ip_addr_str);
+	strcpy(p_thread_data->client_port_str, client_port_str);
+	
+	{
+	    pthread_t thread_id;
+	    if (pthread_create(&thread_id, NULL, client_thread,
+				(void *) p_thread_data)) {
+		perror("pthread_create");
+		shutdown_and_exit(conn_fd, sock_fd, NULL, EXIT_FAILURE);
+	    }
+	    // XXX - Pass void**retval instead of NULL
+	    if (pthread_join(thread_id, NULL)) {
+		perror("pthread_join");
+		shutdown_and_exit(conn_fd, sock_fd, NULL, EXIT_FAILURE);
+	    }
+	    shutdown(p_thread_data->conn_fd, SHUT_RDWR);
+	    close(p_thread_data->conn_fd);
+	    free(p_thread_data);
+	}	
+	// ASSIGNMENT 6
+	// - Create a per socket thread here.
+	// - Malloc thread struct, add to linked list.  Thread struct
+	//   contains: done flag, file_fd, shared mutex to protect writes
+	//   to file, and a the conn_fd returned above.
+	// - The code below (malloc and client not done loop) needs
+	//   to move to the thread.
+	// - Thread will use done flag in thread struct, not client_done
+	// - Reaper thread will scan linked list and join threads when
+	//   client_done.  Can use main thread?  Add select w/ timeout
+	//   between listen and accept?
 
 	// Allocate an initial buffer.  buf_start is the original
 	// buffer returned by malloc and used for realloc/free.
 	// buf_curr is the current recv pointer, used by recv.
-	cur_buf_size = SOCK_READ_BUF_SIZE;
-	if (!(buf_curr = (buf_start = malloc(cur_buf_size)))) {
-	    perror("malloc");
-	    shutdown_and_exit(conn_fd, sock_fd, NULL, EXIT_FAILURE);
-	}
-	while (!client_done) {
-	    // In all likelihood, we will catch the SIGINT/SIGTERM in accept
-	    // or recv, since we will spend most of our time blocked in either
-	    // accept or recv, and the signal handler will never get called
-	    // (in all my testing, that is what happened).  HOWEVER, when
-	    // running the full_test.sh script, sometimes the signal to
-	    // shutdown the test happens outside of accept/recv.  This check
-	    // catches those cases.
-	    if (caught_signal) {
-		shutdown_and_exit(conn_fd, sock_fd, buf_start, EXIT_SUCCESS);
-	    }
-	    // Number of bytes read is length of string (with
-	    // newline), but no null terminator is added.
-	    bytes_read = recv(conn_fd, buf_curr, SOCK_READ_BUF_SIZE, 0);
-	    if (-1 >= bytes_read) {
-		// -1 on error - if recv was interrupted by signal, exit
-		if (EINTR == errno) {
-		    PRINTF("Caught signal in recv, exiting\n");
-		    syslog(LOG_USER|LOG_INFO,"Caught signal, exiting");
-		    shutdown_and_exit(conn_fd, sock_fd, buf_start, EXIT_SUCCESS);
-		} else {
-		    // Other error - exit with failure
-		    perror("recv");
-		    shutdown_and_exit(conn_fd, sock_fd, buf_start, EXIT_FAILURE);
-		}
-	    } else if (0 == bytes_read) {
-		// 0 on remote connection closed
-		client_done = 1;
-		shutdown(conn_fd, SHUT_RDWR);
-		close(conn_fd);
-		free(buf_start);
-		PRINTF("Closed connection from %s:%s\n", client_ip_addr_str,
-		       client_port_str);
-		syslog(LOG_USER|LOG_INFO, "Closed connection from %s",
-		       client_ip_addr_str);
-	    } else if (SOCK_READ_BUF_SIZE == bytes_read) {
-		// If the recv filled the buffer, there may be more data
-		// waiting.  Enlarge the buffer and read some more.
-		cur_buf_size += SOCK_READ_BUF_SIZE;
-		if (!(buf_start = realloc(buf_start, cur_buf_size))) {
-		    perror("realloc");
-		    // Realloc free'd old buffer, nothing to free now
-		    shutdown_and_exit(conn_fd, sock_fd, NULL, EXIT_FAILURE);
-		}
-		// Realloc can move the buffer.  Calculate new read
-		// destination as new buffer start plus current size,
-		// then back up one read block size.
-		buf_curr = buf_start + cur_buf_size - SOCK_READ_BUF_SIZE;
-	    } else {
-		// Read < SOCK_READ_BUF_SIZE and > 0.  We've read all
-		// of the client data.  Null terminate the string,
-		// write to the output file, and return the whole file
-		buf_curr[bytes_read] = 0;
-		PRINTF("length = %ld\n",strlen(buf_start));
-		// Find the first newline, start at byte 0.  If no newline,
-		// use the null at the end.
-		newline_ptr = strchrnul(buf_start,'\n');
-		PRINTF("strchr found newline at offset %d\n", newline_ptr -
-		       buf_start);
-		// Write up to (but NOT including) the newline (or '\0')
-		// pointed to by newline_ptr.  Ignore partial writes (fs full)
-		if (-1 == write(file_fd, buf_start, newline_ptr - buf_start)) {
-		    perror("write");
-		    shutdown_and_exit(conn_fd, sock_fd, buf_start,
-				      EXIT_FAILURE);
-		}
-		// Now write out a trailing newline.  Done separately instead
-		// of writing +1 above, in case we didn't get a newline in the
-		// received packet (which shouldn't happen, since the
-		// assignment says we always get newline
-		buf_start[0] = '\n';
-		if (-1 == write(file_fd, buf_start, 1)) {
-		    perror("write");
-		    shutdown_and_exit(conn_fd, sock_fd, buf_start,
-				      EXIT_FAILURE);
-		}
-		//
-		// Now read the entire file and send it back to the client
-		//
-		// Reset the buffer size and pointers
-		cur_buf_size = SOCK_READ_BUF_SIZE;
-		if (!(buf_curr = (buf_start = realloc(buf_start,
-						      cur_buf_size)))) {
-		    perror("realloc");
-		    shutdown_and_exit(conn_fd, sock_fd, NULL, EXIT_FAILURE);
-		}
-		// Reset file pointer to start.  Should return 0 (requested
-		// set point).  Non-zero is an error (either -1 for error
-		// or some positive number if seek ends elsewhere.
-		// Since the file is opened with O_APPEND, writes atomically
-		// set the file pointer to the end before the write.
-		if (lseek(file_fd, 0, SEEK_SET)) {
-		    perror("lseek");
-		    shutdown_and_exit(conn_fd, sock_fd, buf_start,
-				      EXIT_FAILURE);
-		}
-	        while ((bytes_read = read(file_fd, buf_start, cur_buf_size))) {
-		    if (-1 == bytes_read) {
-			perror("read");
-			shutdown_and_exit(conn_fd, sock_fd, buf_start,
-					  EXIT_FAILURE);
-		    }
-		    PRINTF("bytes_read = %d\n",bytes_read);
-		    // Ignore partial writes.  Shouldn't happen...
-		    if (write(conn_fd, buf_start, bytes_read) != bytes_read) {
-			perror("write");
-			shutdown_and_exit(conn_fd, sock_fd, buf_start,
-					  EXIT_FAILURE);
-		    }
-		}
-	    }
-	}
     }
     // Never get here
     return(0);

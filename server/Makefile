@@ -14,3 +14,4 @@ clean:
 	rm -f aesdsocket *.o
 
 aesdsocket: aesdsocket.o
+	$(CC) -o $@ $^ -pthread
