@@ -6,7 +6,7 @@
 ##
 
 CC = $(CROSS_COMPILE)gcc
-CFLAGS += -Wall -Werror
+CFLAGS += -Wall -Werror -g
 
 all: aesdsocket
 
