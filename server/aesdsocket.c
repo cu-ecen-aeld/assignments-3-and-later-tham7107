@@ -420,15 +420,22 @@ int main(int argc, char *argv[])
 	
         {
 	    pthread_t thread_id;
+	    void * thread_ret_val;
 	    if (pthread_create(&thread_id, NULL, client_thread,
 				(void *) p_thread_data)) {
 		perror("pthread_create");
 		goto free_thread_data;
+	    } else {
+		PRINTF("pthread_create successful, thread_id = %ld\n", thread_id);
 	    }
 	    // XXX - Pass void**retval instead of NULL
-	    if (pthread_join(thread_id, NULL)) {
+	    if (pthread_join(thread_id, &thread_ret_val)) {
 		perror("pthread_join");
 		goto free_thread_data;
+	    }
+	    else
+	    {
+		free(thread_ret_val);
 	    }
 //	    exit_status = EXIT_SUCCESS;
 //	    goto free_thread_data;
@@ -449,7 +456,9 @@ int main(int argc, char *argv[])
 	// buffer returned by malloc and used for realloc/free.
 	// buf_curr is the current recv pointer, used by recv.
     }
-    // Never get here
+
+    // Goto's are bad.  But if they are good enough for error handling/
+    // shutdown in the kernel, they're good enough for me.
 free_thread_data: free(p_thread_data);
 close_conn_fd:    shutdown(conn_fd, SHUT_RDWR); close(conn_fd);
 close_sock_fd:    close(sock_fd);
