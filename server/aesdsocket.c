@@ -23,15 +23,19 @@
 #include <errno.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/queue.h>
+#include <time.h>
 
-#define DEBUG 1
-//#undef DEBUG
+//#define DEBUG 1
+#undef DEBUG
 
 #define TCP_PORT "9000"
-#define SOCKET_LISTEN_BACKLOG 5
-#define IP_ADDR_MAX_STRLEN 20
-#define SOCK_READ_BUF_SIZE 1000
-#define DATAFILE "/var/tmp/aesdsocketdata"
+#define SOCKET_LISTEN_BACKLOG	5
+#define IP_ADDR_MAX_STRLEN	20
+#define TIME_MAX_STRLEN		100
+#define SOCK_READ_BUF_SIZE	1000
+#define DATAFILE		"/var/tmp/aesdsocketdata"
+#define TIMESTAMP_DELAY_SECS	10
 
 #ifdef DEBUG
 #define PRINTF(...) printf(__VA_ARGS__)
@@ -39,19 +43,25 @@
 #define PRINTF(...)
 #endif
 
-struct thread_data {
-    // - Malloc thread struct, add to linked list.  Thread struct
-    //   contains: done flag, file_fd, shared mutex to protect writes
-    //   to file, and a the conn_fd returned above.
+// Thread data passed between main thread and server thread
+struct server_thread_data {
+    pthread_t thread_id;
     pthread_mutex_t *p_file_mutex;
     int file_fd;
     int conn_fd;
     // get rid of sock_fd. threads should not call cleaup routine directly
     int sock_fd;
-
     int client_done;
     char client_ip_addr_str[IP_ADDR_MAX_STRLEN];
     char client_port_str[IP_ADDR_MAX_STRLEN];
+    SLIST_ENTRY(server_thread_data) entries;
+};
+
+// Thread data passed between main thread and server thread
+struct timestamp_thread_data {
+    pthread_t thread_id;
+    pthread_mutex_t *p_file_mutex;
+    int file_fd;
 };
 
 int caught_signal = 0;
@@ -240,9 +250,13 @@ int send_data_file_to_client(int file_fd, int conn_fd, char * buf)
     return 0;
 }
 
-void *client_thread(void *arg)
+// Server thread to handle a single connection from a client.
+// Must free any resources allocated in the thread (ie malloc buffer).
+// Connection socket, etc allocated in main are cleaned up in main
+// thread after server thread exits.
+void *server_thread(void *arg)
 {
-    struct thread_data *p_thread_data = (struct thread_data *)arg;
+    struct server_thread_data *p_thread_data = (struct server_thread_data *)arg;
     sigset_t signal_set;
     char *buf_start, *buf_curr;
     int cur_buf_size;
@@ -258,6 +272,9 @@ void *client_thread(void *arg)
 	pthread_exit(p_thread_data);
     }
 
+    // Allocate an initial buffer.  buf_start is the original
+    // buffer returned by malloc and used for realloc/free.
+    // buf_curr is the current recv pointer, used by recv.
     cur_buf_size = SOCK_READ_BUF_SIZE;
     if (!(buf_curr = (buf_start = malloc(cur_buf_size)))) {
 	perror("malloc");
@@ -339,7 +356,60 @@ void *client_thread(void *arg)
 	    }
 	}
     }
+    // Don't really care about return, since we save the ptr in an SLIST
     return arg;
+}
+
+// Append a timestamp to the output file every TIMESTAMP_DELAY_SECS
+// Re-use the server thread's struct thread_data, since it has the
+//
+// Must free any resources allocated in the thread (ie malloc buffer).
+// Connection socket, etc allocated in main are cleaned up in main
+// thread after server thread exits.
+void *timestamp_thread(void *arg)
+{
+    struct timestamp_thread_data *p_thread_data =
+	(struct timestamp_thread_data *) arg;
+    struct timespec ts;
+    struct tm tm;
+    char timestr[TIME_MAX_STRLEN];
+    size_t timelen;
+
+    while (1) {
+	// Returns a pointer to the supplied struct timespec,
+	// ts.tv_sec is clock time in sec since epoch
+	if (clock_gettime(CLOCK_REALTIME, &ts)) {
+	    perror("clock_gettime");
+	    pthread_exit(p_thread_data);
+	}
+
+	// Returns a pointer to the supplied struct timespec
+	(void) gmtime_r(&(ts.tv_sec), &tm);
+
+	timelen = TIME_MAX_STRLEN;
+	timelen = strftime(timestr, timelen,
+			   "timestamp:%Y-%m-%d %H:%M:%S%n", &tm);
+
+	// Lock mutex around file i/o - can we unlock before read?
+	if (pthread_mutex_lock(p_thread_data->p_file_mutex)) {
+	    perror("pthread_mutex_lock");
+	    pthread_exit(p_thread_data);
+	}
+
+	if (-1 == write(p_thread_data->file_fd, timestr, timelen)) {
+	    perror("write");
+	    pthread_exit(p_thread_data);
+	}
+
+	// Unlock mutex around file i/o - can we unlock before read?
+	if (pthread_mutex_unlock(p_thread_data->p_file_mutex)) {
+	    perror("pthread_mutex_unlock");
+	    pthread_exit(p_thread_data);
+	}
+	PRINTF("TICK!\n");
+	sleep(TIMESTAMP_DELAY_SECS);
+    }
+    return p_thread_data;
 }
 
 int main(int argc, char *argv[])
@@ -347,7 +417,9 @@ int main(int argc, char *argv[])
     int file_fd, sock_fd, conn_fd;
     int arg, daemonize;
     pthread_mutex_t datafile_mutex;
-    struct thread_data *p_thread_data;
+    SLIST_HEAD(slisthead, server_thread_data) thread_list_head;
+    struct timestamp_thread_data *p_timestamp_thread_data;
+    struct server_thread_data *p_server_thread_data;
     char client_ip_addr_str[IP_ADDR_MAX_STRLEN];
     char client_port_str[IP_ADDR_MAX_STRLEN];
     int exit_status = EXIT_FAILURE; // Fail by default
@@ -401,67 +473,87 @@ int main(int argc, char *argv[])
 	goto close_sock_fd;
     }
 
+    SLIST_INIT(&thread_list_head);
+
+    if (!(p_timestamp_thread_data =
+	  malloc(sizeof(struct timestamp_thread_data)))) {
+	perror("malloc");
+	goto close_sock_fd;
+    }
+
+    p_timestamp_thread_data->p_file_mutex = &datafile_mutex;
+    p_timestamp_thread_data->file_fd      = file_fd;
+
+    if (pthread_create(&(p_timestamp_thread_data->thread_id), NULL,
+		       timestamp_thread, (void *) p_timestamp_thread_data)) {
+	perror("pthread_create");
+	goto free_thread_data;
+    } else {
+	PRINTF("timestamp pthread_create successful\n");
+    }
+
     while (1) {
 	conn_fd = wait_for_client_connection(sock_fd, client_ip_addr_str,
 					     client_port_str);
 
-	if (!(p_thread_data = malloc(sizeof(struct thread_data)))) {
+	if (!(p_server_thread_data = malloc(sizeof(struct server_thread_data)))) {
 	    perror("malloc");
 	    goto close_conn_fd;
 	}
 
-	p_thread_data->p_file_mutex = &datafile_mutex;
-	p_thread_data->file_fd      = file_fd;
-	p_thread_data->conn_fd      = conn_fd;
-	p_thread_data->sock_fd      = sock_fd;
-	p_thread_data->client_done  = 0;
-	strcpy(p_thread_data->client_ip_addr_str, client_ip_addr_str);
-	strcpy(p_thread_data->client_port_str, client_port_str);
+	p_server_thread_data->p_file_mutex = &datafile_mutex;
+	p_server_thread_data->file_fd      = file_fd;
+	p_server_thread_data->conn_fd      = conn_fd;
+	p_server_thread_data->sock_fd      = sock_fd;
+	p_server_thread_data->client_done  = 0;
+	strcpy(p_server_thread_data->client_ip_addr_str, client_ip_addr_str);
+	strcpy(p_server_thread_data->client_port_str, client_port_str);
 	
-        {
-	    pthread_t thread_id;
-	    void * thread_ret_val;
-	    if (pthread_create(&thread_id, NULL, client_thread,
-				(void *) p_thread_data)) {
-		perror("pthread_create");
-		goto free_thread_data;
-	    } else {
-		PRINTF("pthread_create successful, thread_id = %ld\n", thread_id);
-	    }
-	    // XXX - Pass void**retval instead of NULL
-	    if (pthread_join(thread_id, &thread_ret_val)) {
+	if (pthread_create(&(p_server_thread_data->thread_id), NULL,
+			   server_thread, (void *) p_server_thread_data)) {
+	    perror("pthread_create");
+	    goto free_thread_data;
+	} else {
+	    PRINTF("pthread_create successful, p_server_thread_data = %p\n",
+		   p_server_thread_data);
+	}
+
+	// Insert the thread_data structure into the list
+	SLIST_INSERT_HEAD(&thread_list_head, p_server_thread_data, entries);
+
+	// Now iterate over the list and join any that are done.
+	// This probably has a race condition - if the last thread
+	// completes while blocked in an accept, we will never join
+	// it.  This is probably the srouce of the "You may see one
+	// possibly lost message which looks like this, which it’s
+	// OK to ignore" message in the assignment.
+	SLIST_FOREACH(p_server_thread_data, &thread_list_head, entries) {
+	    PRINTF("SLIST_FOREACH p_server_thread_data = %p\n", p_server_thread_data);
+	    if (p_server_thread_data->client_done) break;
+	}
+
+	if (p_server_thread_data && p_server_thread_data->client_done) {
+	    SLIST_REMOVE(&thread_list_head, p_server_thread_data,
+			 server_thread_data, entries);
+	    PRINTF("Removed list element = %p\n", p_server_thread_data);
+
+	    // Join finished thread and cleanup previously allocated resources
+	    if (pthread_join(p_server_thread_data->thread_id, NULL)) {
 		perror("pthread_join");
 		goto free_thread_data;
 	    }
-	    else
-	    {
-		free(thread_ret_val);
-	    }
-//	    exit_status = EXIT_SUCCESS;
-//	    goto free_thread_data;
+	    shutdown(p_server_thread_data->conn_fd, SHUT_RDWR);
+	    close(p_server_thread_data->conn_fd);
+	    free(p_server_thread_data);
 	}
-	// ASSIGNMENT 6
-	// - Create a per socket thread here.
-	// - Malloc thread struct, add to linked list.  Thread struct
-	//   contains: done flag, file_fd, shared mutex to protect writes
-	//   to file, and a the conn_fd returned above.
-	// - The code below (malloc and client not done loop) needs
-	//   to move to the thread.
-	// - Thread will use done flag in thread struct, not client_done
-	// - Reaper thread will scan linked list and join threads when
-	//   client_done.  Can use main thread?  Add select w/ timeout
-	//   between listen and accept?
-
-	// Allocate an initial buffer.  buf_start is the original
-	// buffer returned by malloc and used for realloc/free.
-	// buf_curr is the current recv pointer, used by recv.
     }
 
     // Goto's are bad.  But if they are good enough for error handling/
     // shutdown in the kernel, they're good enough for me.
-free_thread_data: free(p_thread_data);
+    // Should iterate and clear all server threads and also timestamp thread
+free_thread_data: free(p_server_thread_data);
 close_conn_fd:    shutdown(conn_fd, SHUT_RDWR); close(conn_fd);
 close_sock_fd:    close(sock_fd);
-close_file_fd:    close(file_fd);// unlink(DATAFILE);
+close_file_fd:    close(file_fd); unlink(DATAFILE);
     exit(exit_status);
 }
