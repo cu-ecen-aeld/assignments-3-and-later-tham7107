@@ -414,12 +414,12 @@ void *timestamp_thread(void *arg)
 
 int main(int argc, char *argv[])
 {
-    int file_fd, sock_fd, conn_fd;
+    int file_fd=0, sock_fd=0, conn_fd=0;
     int arg, daemonize;
     pthread_mutex_t datafile_mutex;
     SLIST_HEAD(slisthead, server_thread_data) thread_list_head;
     struct timestamp_thread_data *p_timestamp_thread_data;
-    struct server_thread_data *p_server_thread_data;
+    struct server_thread_data *p_server_thread_data=NULL;
     char client_ip_addr_str[IP_ADDR_MAX_STRLEN];
     char client_port_str[IP_ADDR_MAX_STRLEN];
     int exit_status = EXIT_FAILURE; // Fail by default
