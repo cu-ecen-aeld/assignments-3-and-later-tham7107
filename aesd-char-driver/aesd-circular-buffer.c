@@ -16,6 +16,11 @@
 
 #include "aesd-circular-buffer.h"
 
+// Macro to advance either in_offs or out_offs and wrap if necessary. Returns
+// new value of offset.  Could be in header, but added here to limit changes
+// to one file.
+#define AESDCHAR_ADVANCE_PTR(x) (((x)+1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED)
+
 /**
  * @param buffer the buffer to search for corresponding offset.  Any necessary locking must be performed by caller.
  * @param char_offset the position to search for in the buffer list, describing the zero referenced
@@ -32,7 +37,25 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
     /**
     * TODO: implement per description
     */
-    return NULL;
+    uint8_t out_offs;
+
+    // Check for NULL inputs, return if so
+    if ((!buffer) || (!entry_offset_byte_rtn)) {
+	return NULL;
+    }
+
+    out_offs = buffer->out_offs;
+    while (buffer->entry[out_offs].size <= char_offset)
+    {
+	char_offset -= buffer->entry[out_offs].size;
+	out_offs = AESDCHAR_ADVANCE_PTR(out_offs);
+	if (out_offs == buffer->in_offs) {
+	    return NULL;
+	}
+    }
+
+    *entry_offset_byte_rtn = char_offset;
+    return &(buffer->entry[out_offs]);
 }
 
 /**
@@ -47,6 +70,34 @@ void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const s
     /**
     * TODO: implement per description
     */
+    // Check for NULL inputs, return if so
+    if ((!buffer) || (!add_entry)) {
+	return;
+    }
+
+    // Three possible states to handle:
+    //  1 - in_offs == out_offs, !full - ring empty, advance in_offs
+    //  2 - in_offs == out_offs, full - advance in_offs and out_offs
+    //      (discard oldest value) - but how do you deallocate lost buffptr?
+    //  3 - in_offs != out_offs, full==<don't care> - advance in_offs and
+    //      check for in_offs == out_offs AFTER increment.  Set full if so.
+    //
+    // First, write the new entry to the array at location in_offs
+    buffer->entry[buffer->in_offs].buffptr = add_entry->buffptr;
+    buffer->entry[buffer->in_offs].size    = add_entry->size;
+
+    // If state 2, advance out_offs, discarding entry (but lost buf? mem leak?)
+    if ((buffer->in_offs == buffer->out_offs) && buffer->full) {
+	buffer->out_offs = AESDCHAR_ADVANCE_PTR(buffer->out_offs);
+    }
+
+    // Advance in_off AFTER check above (analyze pre-insert state)
+    buffer->in_offs = AESDCHAR_ADVANCE_PTR(buffer->in_offs);
+
+    // Set flag if we just filled the buffer (in wrapped around to meet out)
+    if (buffer->in_offs == buffer->out_offs) {
+	buffer->full = true;
+    }
 }
 
 /**
