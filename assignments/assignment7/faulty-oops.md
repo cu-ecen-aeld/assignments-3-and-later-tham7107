@@ -1,3 +1,6 @@
+# Analysis of /dev/faulty error for ECEA 5306 Assignment 7, Part 2
+Below is the output on the console showing the result of executing `echo “hello_world” > /dev/faulty` on the console of the running buildroot image in ECEA 5306 Assignment 7, Part 2:
+```
 Welcome to Buildroot
 buildroot login: root
 Password:
@@ -47,3 +50,38 @@ Code: d2800001 d2800000 d503233f d50323bf (b900003f)
 
 Welcome to Buildroot
 buildroot login:
+```
+The first line "Unable to handle kernel NULL pointer dereference" makes it clear that the fault is a null dereference.  The next several lines ("Mem abort info" through "Data abort info, CM=0, Wnr=1") gives information about the exception.  Next follows VM and page table information.
+
+We can see the famous "Oops" error here: `Internal error: Oops: 96000045 [#1] SMP`.  That is followed by a list of the loaded modules (hello, faulty, and scull), and a reference to the CPU on which the fault occured (0), and the pid and processes name that triggered it (156, sh), an indication that the kernel is tainted by the loaded module, and the name of the hardware ("virt" is the VM type emulated by QEMU).
+
+Next we have CPU register information, followed by a stack trace.  The most important thing to note here is the line `pc : faulty_write+0x14/0x20 [faulty]`.  This tells us the error occured in the module `faulty`, and the routine `faulty_write`.  The fault PC is at `faulty_write+0x14`.  `/0x20` tells us the routine is 0x20 bytes long.
+
+We can use objdump to disassemble the bad code:
+```
+tga@ecea530x:~/ecea5305/assignment-5-tham7107$ buildroot/output/host/bin/aarch64-buildroot-linux-uclibc-objdump -S buildroot/output/target/lib/modules/5.15.18/extra/faulty.ko 
+
+buildroot/output/target/lib/modules/5.15.18/extra/faulty.ko:     file format elf64-littleaarch64
+
+
+Disassembly of section .text:
+
+0000000000000000 <faulty_write>:
+   0:	d503245f 	bti	c
+   4:	d2800001 	mov	x1, #0x0                   	// #0
+   8:	d2800000 	mov	x0, #0x0                   	// #0
+   c:	d503233f 	paciasp
+  10:	d50323bf 	autiasp
+  14:	b900003f 	str	wzr, [x1]
+  18:	d65f03c0 	ret
+  1c:	d503201f 	nop
+
+0000000000000020 <faulty_read>:
+  20:	d503233f 	paciasp
+  ```
+Note, -S is not displaying source, as the module was compiled without `-g`.  However, we can clearly confirm the following:
+* The routine `faulty_write` is clearly 0x20 bytes long (starts at 0x0, last instruction at 0x1c, and `faulty_read` starts at 0x20).
+* The register x1 is loaded with 0 at instruction address 0x4
+* The store at 0x14 (the fault address) is attempting to write 0 (wzr, the zero register) to the address pointed to by x1, loaded 4 instructions above with 0.
+
+Thus, the store at 0x14 is our `*(int *)0 = 0;` in `faulty_write` at `faulty.c:53`
