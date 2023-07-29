@@ -17,11 +17,12 @@
 #include <linux/types.h>
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
+#include <linux/slab.h> // kmalloc/free
 #include "aesdchar.h"
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
-MODULE_AUTHOR("Your Name Here"); /** TODO: fill in your name **/
+MODULE_AUTHOR("Thomas Ames"); /** TODO: fill in your name **/
 MODULE_LICENSE("Dual BSD/GPL");
 
 struct aesd_dev aesd_device;
@@ -63,6 +64,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     /**
      * TODO: handle write
      */
+    //kmalloc(size, GFP_KERNEL);
     return retval;
 }
 struct file_operations aesd_fops = {
@@ -105,6 +107,13 @@ int aesd_init_module(void)
     /**
      * TODO: initialize the AESD specific portion of the device
      */
+    // memset above 0'ed out aesd_device.circ_buf, so call to
+    // aesd_circular_buffer_init and setting partial_write isn't really
+    // necessary, but here for completeness.
+    aesd_circular_buffer_init(&aesd_device.circ_buf);
+    aesd_device.partial_write.buffptr = NULL;
+    aesd_device.partial_write.size = 0;
+    mutex_init(&aesd_device.lock);
 
     result = aesd_setup_cdev(&aesd_device);
 
@@ -118,13 +127,29 @@ int aesd_init_module(void)
 void aesd_cleanup_module(void)
 {
     dev_t devno = MKDEV(aesd_major, aesd_minor);
+    uint8_t index;
+    struct aesd_circular_buffer buffer;
+    struct aesd_buffer_entry *entry;
 
     cdev_del(&aesd_device.cdev);
 
     /**
      * TODO: cleanup AESD specific poritions here as necessary
      */
+    // Returns 0 if lock aquired, non-zero if timeout
+    while (mutex_lock_interruptible(&aesd_device.lock))
+	;
+    AESD_CIRCULAR_BUFFER_FOREACH(entry,&buffer,index) {
+	kfree(entry->buffptr);
+    }
 
+    // Cleanup mutex?
+
+    // Don't need to check for bufptr == NULL, kfree(NULL) is nop
+    if(aesd_device.partial_write.buffptr) {
+	kfree(aesd_device.partial_write.buffptr);
+    }
+    mutex_unlock(&aesd_device.lock);
     unregister_chrdev_region(devno, 1);
 }
 
