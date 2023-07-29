@@ -32,10 +32,11 @@ struct aesd_dev
     /**
      * TODO: Add structure(s) and locks needed to complete assignment requirements
      */
+    // cdev @ start - single inheritance, p_cdev = p_aesd_dev
+    struct cdev cdev;     /* Char device structure      */
     struct aesd_circular_buffer circ_buf;
     struct aesd_buffer_entry partial_write;
     struct mutex lock;
-    struct cdev cdev;     /* Char device structure      */
 };
 
 

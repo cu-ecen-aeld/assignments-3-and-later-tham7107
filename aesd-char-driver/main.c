@@ -33,6 +33,10 @@ int aesd_open(struct inode *inode, struct file *filp)
     /**
      * TODO: handle open
      */
+
+    // Use container_of macro to get pointer to the cdev.  First field
+    // of aesd_dev is cdev, so p_cdev == p_aesd_dev
+    filp->private_data = container_of(inode->i_cdev, struct aesd_dev, cdev);
     return 0;
 }
 
@@ -54,17 +58,35 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
      * TODO: handle read
      */
     return retval;
+//unsigned long copy_to_user(void __user *to, const void *from, unsigned long count);
 }
 
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
 {
+    void * kmem_buf;
     ssize_t retval = -ENOMEM;
+
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
     /**
      * TODO: handle write
      */
-    //kmalloc(size, GFP_KERNEL);
+
+    if(!(kmem_buf = kmalloc(count, GFP_KERNEL))) {
+	printk("write: kmalloc(%ld, GFP_KERNEL) returned NULL", count);
+	return -ENOMEM;
+    }
+
+    // copy_from_user returns number of bytes that could NOT be copied,
+    // ie, 0 on success. # bytes copied is count-return value
+    retval = count - copy_from_user(kmem_buf, buf, count);
+
+    PDEBUG("write: user buf = %p, kmem_buf = %p, retval = %ld", buf,
+	   kmem_buf, retval);
+
+//    const char * aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry)
+    kfree(kmem_buf);
+
     return retval;
 }
 struct file_operations aesd_fops = {
@@ -120,6 +142,9 @@ int aesd_init_module(void)
     if( result ) {
         unregister_chrdev_region(dev, 1);
     }
+    PDEBUG("aesd_init_module(), result=%d, &aesd_device = %p", result,
+	   &aesd_device);
+
     return result;
 
 }
@@ -137,8 +162,9 @@ void aesd_cleanup_module(void)
      * TODO: cleanup AESD specific poritions here as necessary
      */
     // Returns 0 if lock aquired, non-zero if timeout
-    while (mutex_lock_interruptible(&aesd_device.lock))
+/*    while (mutex_lock_interruptible(&aesd_device.lock))
 	;
+*/
     AESD_CIRCULAR_BUFFER_FOREACH(entry,&buffer,index) {
 	kfree(entry->buffptr);
     }
@@ -149,7 +175,8 @@ void aesd_cleanup_module(void)
     if(aesd_device.partial_write.buffptr) {
 	kfree(aesd_device.partial_write.buffptr);
     }
-    mutex_unlock(&aesd_device.lock);
+/*    mutex_unlock(&aesd_device.lock);
+ */
     unregister_chrdev_region(devno, 1);
 }
 
