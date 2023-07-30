@@ -117,33 +117,70 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
      * TODO: handle write
      */
 
-    if (!(kmem_buf = kmalloc(count, GFP_KERNEL))) {
-	printk("write: kmalloc(%ld, GFP_KERNEL) returned NULL", count);
-	return -ENOMEM;
-    }
-
     // Returns 0 if lock aquired, -EINTR if interrupted. Probably don't
     // need to lock the ENTIRE function body.
     if (mutex_lock_interruptible(&aesd_device.lock)) {
-	kfree(kmem_buf);
 	return -EINTR;
     }
 
-    // copy_from_user returns number of bytes that could NOT be copied,
-    // ie, 0 on success. # bytes copied is count-return value
-    retval = count - copy_from_user(kmem_buf, buf, count);
+    // Partial write in progress?
+    if (p_aesd_dev->partial_write.buffptr) {
+	// Partial write in progress, expand current buffer by count
+	if (!(kmem_buf = kmalloc(count + p_aesd_dev->partial_write.size,
+				 GFP_KERNEL))) {
+	    printk("write: kmalloc(%ld, GFP_KERNEL) returned NULL", count);
+	    mutex_unlock(&aesd_device.lock);
+	    return -ENOMEM;
+	} else {
+	    // Copy the previous partial write to the new, larger buffer
+	    memcpy(kmem_buf, p_aesd_dev->partial_write.buffptr,
+		   p_aesd_dev->partial_write.size);
+	    // Deallocate old buffer, save new.
+	    kfree(p_aesd_dev->partial_write.buffptr);
+	    p_aesd_dev->partial_write.buffptr = kmem_buf;
+	    // Increment kmem_buf to first byte after previous write
+	    kmem_buf += p_aesd_dev->partial_write.size;
+	}
+    } else {
+	// No previous partial write, but this one may be partial...
+	if (!(kmem_buf = kmalloc(count, GFP_KERNEL))) {
+	    printk("write: kmalloc(%ld, GFP_KERNEL) returned NULL", count);
+	    mutex_unlock(&aesd_device.lock);
+	    return -ENOMEM;
+	} else {
+	    p_aesd_dev->partial_write.buffptr = kmem_buf;
+	    p_aesd_dev->partial_write.size = 0;
+	}
+    }
 
+    // At this point, we are either in the middle of a partial write, or
+    // assuming we are starting a new partial write.  The following are
+    // valid:
+    //   kmem_buf is the pointer in the new buffer to write the data
+    //   p_aesd_dev->partial_write.buffptr holds the address of the first
+    //     partial write (possibly this one)
+    //   p_aesd_dev->partial_write.size is the size of the prior partial
+    //     write(s). 0 if this is a new one
+    // Remaining steps:
+    //  - Copy from user buf to kmem_buf
+    //  - Add count to p_aesd_dev->partial_write.size
+    //  - If newline terminated, add to circular buffer and NULL out
+    //    partial_write
+
+    // copy_from_user returns number of bytes NOT copied, 0 on success
+    retval = count - copy_from_user(kmem_buf, buf, count);
+    p_aesd_dev->partial_write.size += retval;
+
+    if ('\n' == *((char *)kmem_buf+retval)) {
+	if ((add_entry_retval =
+	     aesd_circular_buffer_add_entry(&(p_aesd_dev->circ_buf),
+					    &buf_entry))) {
+	    kfree(add_entry_retval);
+	}
+	PDEBUG("write: add_entry_retval = %p", add_entry_retval);
+    }
     PDEBUG("write: user buf = %p, kmem_buf = %p, retval = %ld", buf,
 	   kmem_buf, retval);
-
-    buf_entry.buffptr = kmem_buf;
-    buf_entry.size = retval;
-
-    if ((add_entry_retval =
-	 aesd_circular_buffer_add_entry(&(p_aesd_dev->circ_buf), &buf_entry))) {
-	kfree(add_entry_retval);
-    }
-    PDEBUG("write: add_entry_retval = %p", add_entry_retval);
 
     mutex_unlock(&aesd_device.lock);
     return retval;
