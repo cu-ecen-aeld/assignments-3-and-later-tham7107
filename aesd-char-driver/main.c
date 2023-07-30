@@ -37,6 +37,8 @@ int aesd_open(struct inode *inode, struct file *filp)
     // Use container_of macro to get pointer to the cdev.  First field
     // of aesd_dev is cdev, so p_cdev == p_aesd_dev
     filp->private_data = container_of(inode->i_cdev, struct aesd_dev, cdev);
+    PDEBUG("filp->private_data = %p, inode->i_cdev = %p, &aesd_device = %p",
+	   filp->private_data, inode->i_cdev, &aesd_device);
     return 0;
 }
 
@@ -64,7 +66,10 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
 {
+    struct aesd_dev *p_aesd_dev = (struct aesd_dev *) filp->private_data;
     void * kmem_buf;
+    struct aesd_buffer_entry buf_entry;
+    const char * add_entry_retval;
     ssize_t retval = -ENOMEM;
 
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
@@ -84,8 +89,14 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     PDEBUG("write: user buf = %p, kmem_buf = %p, retval = %ld", buf,
 	   kmem_buf, retval);
 
-//    const char * aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry)
-    kfree(kmem_buf);
+    buf_entry.buffptr = kmem_buf;
+    buf_entry.size = retval;
+
+    if ((add_entry_retval =
+	 aesd_circular_buffer_add_entry(&(p_aesd_dev->circ_buf), &buf_entry))) {
+	kfree(add_entry_retval);
+    }
+    PDEBUG("write: add_entry_retval = %p", add_entry_retval);
 
     return retval;
 }
@@ -153,7 +164,6 @@ void aesd_cleanup_module(void)
 {
     dev_t devno = MKDEV(aesd_major, aesd_minor);
     uint8_t index;
-    struct aesd_circular_buffer buffer;
     struct aesd_buffer_entry *entry;
 
     cdev_del(&aesd_device.cdev);
@@ -163,10 +173,11 @@ void aesd_cleanup_module(void)
      */
     // Returns 0 if lock aquired, non-zero if timeout
 /*    while (mutex_lock_interruptible(&aesd_device.lock))
-	;
+pp	;
 */
-    AESD_CIRCULAR_BUFFER_FOREACH(entry,&buffer,index) {
-	kfree(entry->buffptr);
+    AESD_CIRCULAR_BUFFER_FOREACH(entry,&aesd_device.circ_buf,index) {
+	PDEBUG("aesd_cleanup_module, entry->buffptr = %p", entry->buffptr);
+//	kfree(entry->buffptr);
     }
 
     // Cleanup mutex?
