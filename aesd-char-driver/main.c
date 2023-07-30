@@ -68,6 +68,12 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     /**
      * TODO: handle read
      */
+    // Returns 0 if lock aquired, -EINTR if interrupted. Probably don't
+    // need to lock the ENTIRE function body.
+    if (mutex_lock_interruptible(&aesd_device.lock)) {
+	return -EINTR;
+    }
+
     p_cir_buf_entry =
 	aesd_circular_buffer_find_entry_offset_for_fpos(&(p_aesd_dev->circ_buf),
 							*f_pos,
@@ -75,6 +81,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     // If NULL, gone past end of circular buffer, no more data to read.
     // Return 0 to indicate EOF
     if (!p_cir_buf_entry) {
+	mutex_unlock(&aesd_device.lock);
 	return 0;
     }
 
@@ -91,6 +98,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     retval = bytes_to_copy - copy_to_user(buf, from_buf, bytes_to_copy);
     *f_pos += retval;
     PDEBUG("read update offset to %lld, retval %ld",*f_pos,retval);
+    mutex_unlock(&aesd_device.lock);
     return retval;
 }
 
@@ -114,6 +122,13 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 	return -ENOMEM;
     }
 
+    // Returns 0 if lock aquired, -EINTR if interrupted. Probably don't
+    // need to lock the ENTIRE function body.
+    if (mutex_lock_interruptible(&aesd_device.lock)) {
+	kfree(kmem_buf);
+	return -EINTR;
+    }
+
     // copy_from_user returns number of bytes that could NOT be copied,
     // ie, 0 on success. # bytes copied is count-return value
     retval = count - copy_from_user(kmem_buf, buf, count);
@@ -130,6 +145,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     }
     PDEBUG("write: add_entry_retval = %p", add_entry_retval);
 
+    mutex_unlock(&aesd_device.lock);
     return retval;
 }
 struct file_operations aesd_fops = {
