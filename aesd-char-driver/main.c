@@ -56,18 +56,46 @@ int aesd_release(struct inode *inode, struct file *filp)
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
+    // Probably safe to assume the kernel doesn't pass a null filp
+    struct aesd_dev *p_aesd_dev = (struct aesd_dev *) filp->private_data;
+    struct aesd_buffer_entry *p_cir_buf_entry;
+    size_t cir_buf_entry_offset;
+    const void * from_buf;
+    size_t avail_bytes_in_buf, bytes_to_copy;
     ssize_t retval = 0;
+
     PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
     /**
      * TODO: handle read
      */
+    p_cir_buf_entry =
+	aesd_circular_buffer_find_entry_offset_for_fpos(&(p_aesd_dev->circ_buf),
+							*f_pos,
+							&cir_buf_entry_offset);
+    // If NULL, gone past end of circular buffer, no more data to read.
+    // Return 0 to indicate EOF
+    if (!p_cir_buf_entry) {
+	return 0;
+    }
+
+    // p_cir_buf_entry holds a valid pointer to a buffer entry.
+    // p_cir_buf_entry->buffptr is the START of the buffer.  Desired
+    // data starts at p_cir_buf_entry->buffptr + cir_buf_entry_offset,
+    // available bytes is p_cir_buf_entry->size - cir_buf_entry_offset.
+    from_buf = p_cir_buf_entry->buffptr + cir_buf_entry_offset;
+    avail_bytes_in_buf = p_cir_buf_entry->size - cir_buf_entry_offset;
+    bytes_to_copy = min(avail_bytes_in_buf, count);
+
+    // bytes_to_copy returns number NOT copied, 0 on success.
+    // subtract # failed from number desired to get # copied
+    retval = bytes_to_copy - copy_to_user(buf, from_buf, bytes_to_copy);
     return retval;
-//unsigned long copy_to_user(void __user *to, const void *from, unsigned long count);
 }
 
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
 {
+    // Probably safe to assume the kernel doesn't pass a null filp
     struct aesd_dev *p_aesd_dev = (struct aesd_dev *) filp->private_data;
     void * kmem_buf;
     struct aesd_buffer_entry buf_entry;
