@@ -89,6 +89,8 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     // bytes_to_copy returns number NOT copied, 0 on success.
     // subtract # failed from number desired to get # copied
     retval = bytes_to_copy - copy_to_user(buf, from_buf, bytes_to_copy);
+    *f_pos += retval;
+    PDEBUG("read update offset to %lld, retval %ld",*f_pos,retval);
     return retval;
 }
 
