@@ -48,6 +48,8 @@ int aesd_release(struct inode *inode, struct file *filp)
     /**
      * TODO: handle release
      */
+    // Nothing to do - release is the opposite of open, but we don't
+    // do anything in open that needs to be undone.
     return 0;
 }
 
@@ -77,7 +79,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
      * TODO: handle write
      */
 
-    if(!(kmem_buf = kmalloc(count, GFP_KERNEL))) {
+    if (!(kmem_buf = kmalloc(count, GFP_KERNEL))) {
 	printk("write: kmalloc(%ld, GFP_KERNEL) returned NULL", count);
 	return -ENOMEM;
     }
@@ -171,23 +173,30 @@ void aesd_cleanup_module(void)
     /**
      * TODO: cleanup AESD specific poritions here as necessary
      */
-    // Returns 0 if lock aquired, non-zero if timeout
-/*    while (mutex_lock_interruptible(&aesd_device.lock))
-pp	;
-*/
-    AESD_CIRCULAR_BUFFER_FOREACH(entry,&aesd_device.circ_buf,index) {
-	PDEBUG("aesd_cleanup_module, entry->buffptr = %p", entry->buffptr);
-//	kfree(entry->buffptr);
+    // Returns 0 if lock aquired, -EINTR if interrupted. Maybe
+    // we should continue anyway?
+    if (mutex_lock_interruptible(&aesd_device.lock)) {
+	return;
     }
 
-    // Cleanup mutex?
+    AESD_CIRCULAR_BUFFER_FOREACH(entry,&aesd_device.circ_buf,index) {
+	PDEBUG("aesd_cleanup_module, index = %d, entry->buffptr = %p",
+	       index, entry->buffptr);
+	if (entry->buffptr) {
+	    kfree(entry->buffptr);
+	}
+    }
+
+    // Last PDEBUG seems to get lost, so use a dummy one here...
+    PDEBUG("");
 
     // Don't need to check for bufptr == NULL, kfree(NULL) is nop
-    if(aesd_device.partial_write.buffptr) {
+    if (aesd_device.partial_write.buffptr) {
 	kfree(aesd_device.partial_write.buffptr);
     }
-/*    mutex_unlock(&aesd_device.lock);
- */
+
+    mutex_unlock(&aesd_device.lock);
+
     unregister_chrdev_region(devno, 1);
 }
 
