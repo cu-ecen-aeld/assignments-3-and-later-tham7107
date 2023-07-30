@@ -108,7 +108,6 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     // Probably safe to assume the kernel doesn't pass a null filp
     struct aesd_dev *p_aesd_dev = (struct aesd_dev *) filp->private_data;
     void * kmem_buf;
-    struct aesd_buffer_entry buf_entry;
     const char * add_entry_retval;
     ssize_t retval = -ENOMEM;
 
@@ -171,12 +170,14 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     retval = count - copy_from_user(kmem_buf, buf, count);
     p_aesd_dev->partial_write.size += retval;
 
-    if ('\n' == *((char *)kmem_buf+retval)) {
+    if ('\n' == *((char *)kmem_buf+(retval-1))) {
 	if ((add_entry_retval =
 	     aesd_circular_buffer_add_entry(&(p_aesd_dev->circ_buf),
-					    &buf_entry))) {
+					    &(p_aesd_dev->partial_write)))) {
 	    kfree(add_entry_retval);
 	}
+	p_aesd_dev->partial_write.buffptr = NULL;
+	p_aesd_dev->partial_write.size = 0;
 	PDEBUG("write: add_entry_retval = %p", add_entry_retval);
     }
     PDEBUG("write: user buf = %p, kmem_buf = %p, retval = %ld", buf,
