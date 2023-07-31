@@ -38,9 +38,13 @@
 #define TIME_MAX_STRLEN		100
 #define SOCK_READ_BUF_SIZE	1000
 #ifdef USE_AESD_CHAR_DEVICE
-#define DATAFILE		"/dev/aesdchar"
+#define DATAFILE_NAME		"/dev/aesdchar"
+#define DATAFILE_FLAGS		(O_RDWR)
+#define DATAFILE_MODE		0	// Not used for /dev/aesdchar
 #else // USE_AESD_CHAR_DEVICE
-#define DATAFILE		"/var/tmp/aesdsocketdata"
+#define DATAFILE_NAME		"/var/tmp/aesdsocketdata"
+#define DATAFILE_FLAGS		(O_CREAT | O_APPEND | O_RDWR)
+#define DATAFILE_MODE		(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 #endif // USE_AESD_CHAR_DEVICE
 #define TIMESTAMP_DELAY_SECS	10
 
@@ -54,7 +58,6 @@
 struct server_thread_data {
     pthread_t thread_id;
     pthread_mutex_t *p_file_mutex;
-    int file_fd;
     int conn_fd;
     // get rid of sock_fd. threads should not call cleaup routine directly
     int sock_fd;
@@ -68,7 +71,6 @@ struct server_thread_data {
 struct timestamp_thread_data {
     pthread_t thread_id;
     pthread_mutex_t *p_file_mutex;
-    int file_fd;
 };
 
 int caught_signal = 0;
@@ -181,7 +183,7 @@ int wait_for_client_connection(int sock_fd, char *client_ip_addr_str,
 	    PRINTF("Caught signal in accept, exiting\n");
 	    close(sock_fd);
 #ifndef USE_AESD_CHAR_DEVICE
-	    unlink(DATAFILE);
+	    unlink(DATAFILE_NAME);
 #endif // USE_AESD_CHAR_DEVICE
 	    syslog(LOG_USER|LOG_INFO,"Caught signal, exiting");
 	    exit(EXIT_SUCCESS);
@@ -274,6 +276,7 @@ void *server_thread(void *arg)
     int cur_buf_size;
     int bytes_read;
     char *newline_ptr;
+    int file_fd;
 
     // Block SIGINT and SIGTERM - let main thread handle them.
     sigemptyset(&signal_set);
@@ -337,24 +340,41 @@ void *server_thread(void *arg)
 	    if (pthread_mutex_lock(p_thread_data->p_file_mutex)) {
 		perror("pthread_mutex_lock");
 		free(buf_start);
-		pthread_exit(p_thread_data);		
+		pthread_exit(p_thread_data);
 	    }
 	    
 
-	    if (write_data_file(p_thread_data->file_fd, buf_start,
+	    if (-1 == (file_fd = open(DATAFILE_NAME, DATAFILE_FLAGS,
+				      DATAFILE_MODE))) {
+		perror("open");
+		// Things are already broken. Ignore return of unlock
+		(void) pthread_mutex_unlock(p_thread_data->p_file_mutex);
+		free(buf_start);
+		pthread_exit(p_thread_data);
+	    }
+
+	    if (write_data_file(file_fd, buf_start,
 				newline_ptr - buf_start) ||
-		send_data_file_to_client(p_thread_data->file_fd,
+		send_data_file_to_client(file_fd,
 					 p_thread_data->conn_fd,
 					 buf_start)) {
+		(void) pthread_mutex_unlock(p_thread_data->p_file_mutex);
 		free(buf_start);
-		pthread_exit(p_thread_data);		
+		pthread_exit(p_thread_data);
+	    }
+
+	    if (-1 == close(file_fd)) {
+		perror("close");
+		(void) pthread_mutex_unlock(p_thread_data->p_file_mutex);
+		free(buf_start);
+		pthread_exit(p_thread_data);
 	    }
 
 	    // Unlock mutex around file i/o - can we unlock before read?
 	    if (pthread_mutex_unlock(p_thread_data->p_file_mutex)) {
 		perror("pthread_mutex_unlock");
 		free(buf_start);
-		pthread_exit(p_thread_data);		
+		pthread_exit(p_thread_data);
 	    }
 
 	    // Now read the entire file and send it back to the client
@@ -364,7 +384,7 @@ void *server_thread(void *arg)
 	    if (!(buf_curr = (buf_start = realloc(buf_start,
 						  cur_buf_size)))) {
 		perror("realloc");
-		pthread_exit(p_thread_data);		
+		pthread_exit(p_thread_data);
 	    }
 	}
     }
@@ -387,6 +407,7 @@ void *timestamp_thread(void *arg)
     struct tm tm;
     char timestr[TIME_MAX_STRLEN];
     size_t timelen;
+    int file_fd;
 
     while (1) {
 	// Returns a pointer to the supplied struct timespec,
@@ -409,8 +430,23 @@ void *timestamp_thread(void *arg)
 	    pthread_exit(p_thread_data);
 	}
 
-	if (-1 == write(p_thread_data->file_fd, timestr, timelen)) {
+	if (-1 == (file_fd = open(DATAFILE_NAME, DATAFILE_FLAGS,
+				  DATAFILE_MODE))) {
+	    perror("open");
+	    // Things are already broken. Ignore return of unlock
+	    (void) pthread_mutex_unlock(p_thread_data->p_file_mutex);
+	    pthread_exit(p_thread_data);
+	}
+
+	if (-1 == write(file_fd, timestr, timelen)) {
 	    perror("write");
+	    (void) pthread_mutex_unlock(p_thread_data->p_file_mutex);
+	    pthread_exit(p_thread_data);
+	}
+
+	if (-1 == close(file_fd)) {
+	    perror("close");
+	    (void) pthread_mutex_unlock(p_thread_data->p_file_mutex);
 	    pthread_exit(p_thread_data);
 	}
 
@@ -428,7 +464,7 @@ void *timestamp_thread(void *arg)
 
 int main(int argc, char *argv[])
 {
-    int file_fd=0, sock_fd=0, conn_fd=0;
+    int sock_fd=0, conn_fd=0;
     int arg, daemonize;
     pthread_mutex_t datafile_mutex;
     SLIST_HEAD(slisthead, server_thread_data) thread_list_head;
@@ -440,11 +476,12 @@ int main(int argc, char *argv[])
     char client_port_str[IP_ADDR_MAX_STRLEN];
     int exit_status = EXIT_FAILURE; // Fail by default
 
-    if (-1 == (file_fd = open(DATAFILE, O_CREAT | O_APPEND | O_TRUNC | O_RDWR,
-			      S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH))) {
-	perror("open");
-	goto close_file_fd;
-    }
+    // File open/close pairing moved to threads in assignment 8
+    // so mod unload in QEMU will work.  Instead, delete old local
+    // file if not using aesdchar device.
+#ifndef USE_AESD_CHAR_DEVICE
+    unlink(DATAFILE_NAME);
+#endif // USE_AESD_CHAR_DEVICE
 
     // Connect SIGINT and SIGTERM - perror and exit's on failure
     setup_signals();
@@ -499,7 +536,6 @@ int main(int argc, char *argv[])
     }
 
     p_timestamp_thread_data->p_file_mutex = &datafile_mutex;
-    p_timestamp_thread_data->file_fd      = file_fd;
 
     if (pthread_create(&(p_timestamp_thread_data->thread_id), NULL,
 		       timestamp_thread, (void *) p_timestamp_thread_data)) {
@@ -520,7 +556,6 @@ int main(int argc, char *argv[])
 	}
 
 	p_server_thread_data->p_file_mutex = &datafile_mutex;
-	p_server_thread_data->file_fd      = file_fd;
 	p_server_thread_data->conn_fd      = conn_fd;
 	p_server_thread_data->sock_fd      = sock_fd;
 	p_server_thread_data->client_done  = 0;
@@ -572,10 +607,8 @@ int main(int argc, char *argv[])
 free_thread_data: free(p_server_thread_data);
 close_conn_fd:    shutdown(conn_fd, SHUT_RDWR); close(conn_fd);
 close_sock_fd:    close(sock_fd);
-#ifdef USE_AESD_CHAR_DEVICE
-close_file_fd:    close(file_fd);
-#else // USE_AESD_CHAR_DEVICE
-close_file_fd:    close(file_fd); unlink(DATAFILE);
+#ifndef USE_AESD_CHAR_DEVICE
+    unlink(DATAFILE_NAME);
 #endif // USE_AESD_CHAR_DEVICE
     exit(exit_status);
 }
