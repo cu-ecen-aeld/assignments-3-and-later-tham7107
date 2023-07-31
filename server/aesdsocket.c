@@ -29,12 +29,19 @@
 //#define DEBUG 1
 #undef DEBUG
 
+#define USE_AESD_CHAR_DEVICE	1
+//#undef USE_AESD_CHAR_DEVICE
+
 #define TCP_PORT "9000"
 #define SOCKET_LISTEN_BACKLOG	5
 #define IP_ADDR_MAX_STRLEN	20
 #define TIME_MAX_STRLEN		100
 #define SOCK_READ_BUF_SIZE	1000
+#ifdef USE_AESD_CHAR_DEVICE
+#define DATAFILE		"/dev/aesdchar"
+#else // USE_AESD_CHAR_DEVICE
 #define DATAFILE		"/var/tmp/aesdsocketdata"
+#endif // USE_AESD_CHAR_DEVICE
 #define TIMESTAMP_DELAY_SECS	10
 
 #ifdef DEBUG
@@ -173,7 +180,9 @@ int wait_for_client_connection(int sock_fd, char *client_ip_addr_str,
 	    // since there isn't a connection to clean up yet.
 	    PRINTF("Caught signal in accept, exiting\n");
 	    close(sock_fd);
+#ifndef USE_AESD_CHAR_DEVICE
 	    unlink(DATAFILE);
+#endif // USE_AESD_CHAR_DEVICE
 	    syslog(LOG_USER|LOG_INFO,"Caught signal, exiting");
 	    exit(EXIT_SUCCESS);
 	} else {
@@ -231,10 +240,13 @@ int send_data_file_to_client(int file_fd, int conn_fd, char * buf)
     // or some positive number if seek ends elsewhere.
     // Since the file is opened with O_APPEND, writes atomically
     // set the file pointer to the end before the write.
+#ifndef USE_AESD_CHAR_DEVICE
     if (lseek(file_fd, 0, SEEK_SET)) {
 	perror("lseek");
 	return (-1);
     }
+#endif // USE_AESD_CHAR_DEVICE
+
     while ((bytes_read = read(file_fd, buf, SOCK_READ_BUF_SIZE))) {
 	if (-1 == bytes_read) {
 	    perror("read");
@@ -366,6 +378,7 @@ void *server_thread(void *arg)
 // Must free any resources allocated in the thread (ie malloc buffer).
 // Connection socket, etc allocated in main are cleaned up in main
 // thread after server thread exits.
+#ifndef USE_AESD_CHAR_DEVICE
 void *timestamp_thread(void *arg)
 {
     struct timestamp_thread_data *p_thread_data =
@@ -411,6 +424,7 @@ void *timestamp_thread(void *arg)
     }
     return p_thread_data;
 }
+#endif // USE_AESD_CHAR_DEVICE
 
 int main(int argc, char *argv[])
 {
@@ -418,7 +432,9 @@ int main(int argc, char *argv[])
     int arg, daemonize;
     pthread_mutex_t datafile_mutex;
     SLIST_HEAD(slisthead, server_thread_data) thread_list_head;
+#ifndef USE_AESD_CHAR_DEVICE
     struct timestamp_thread_data *p_timestamp_thread_data;
+#endif // USE_AESD_CHAR_DEVICE
     struct server_thread_data *p_server_thread_data=NULL;
     char client_ip_addr_str[IP_ADDR_MAX_STRLEN];
     char client_port_str[IP_ADDR_MAX_STRLEN];
@@ -475,6 +491,7 @@ int main(int argc, char *argv[])
 
     SLIST_INIT(&thread_list_head);
 
+#ifndef USE_AESD_CHAR_DEVICE
     if (!(p_timestamp_thread_data =
 	  malloc(sizeof(struct timestamp_thread_data)))) {
 	perror("malloc");
@@ -491,6 +508,7 @@ int main(int argc, char *argv[])
     } else {
 	PRINTF("timestamp pthread_create successful\n");
     }
+#endif // USE_AESD_CHAR_DEVICE
 
     while (1) {
 	conn_fd = wait_for_client_connection(sock_fd, client_ip_addr_str,
@@ -554,6 +572,10 @@ int main(int argc, char *argv[])
 free_thread_data: free(p_server_thread_data);
 close_conn_fd:    shutdown(conn_fd, SHUT_RDWR); close(conn_fd);
 close_sock_fd:    close(sock_fd);
+#ifdef USE_AESD_CHAR_DEVICE
+close_file_fd:    close(file_fd);
+#else // USE_AESD_CHAR_DEVICE
 close_file_fd:    close(file_fd); unlink(DATAFILE);
+#endif // USE_AESD_CHAR_DEVICE
     exit(exit_status);
 }
