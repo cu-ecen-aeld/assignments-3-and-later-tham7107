@@ -79,8 +79,12 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
 							*f_pos,
 							&cir_buf_entry_offset);
     // If NULL, gone past end of circular buffer, no more data to read.
-    // Return 0 to indicate EOF
+    // Return 0 to indicate EOF.  Also reset f_pos to 0 so next reads
+    // starts at begining of the circular buffer; ie, each new read should
+    // return to start of buffer - implicit seek(fd,0,seek_set)
+    // May need to revisit this when we add seek support in assignment 9?
     if (!p_cir_buf_entry) {
+	*f_pos = 0;
 	mutex_unlock(&aesd_device.lock);
 	return 0;
     }
