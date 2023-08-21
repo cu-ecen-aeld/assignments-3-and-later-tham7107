@@ -75,9 +75,9 @@ extern loff_t aesd_circular_buffer_size(struct aesd_circular_buffer *buffer);
  * }
  */
 #define AESD_CIRCULAR_BUFFER_FOREACH(entryptr,buffer,index) \
-    for(index=0, entryptr=&((buffer)->entry[index]); \
+    for(index=0, entryptr=&((buffer)->entry[((buffer)->out_offs+index) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED]); \
             index<AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; \
-            index++, entryptr=&((buffer)->entry[index]))
+            index++, entryptr=&((buffer)->entry[((buffer)->out_offs+index) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED]))
 
 
 
