@@ -119,3 +119,21 @@ void aesd_circular_buffer_init(struct aesd_circular_buffer *buffer)
 {
     memset(buffer,0,sizeof(struct aesd_circular_buffer));
 }
+
+/*
+ * Returns total number of bytes in buffer.
+ * Any necessary locking must be performed by caller.
+ */
+loff_t aesd_circular_buffer_size(struct aesd_circular_buffer *buffer)
+{
+    struct aesd_buffer_entry *entry;
+    uint8_t index;
+    loff_t retval = 0;
+
+    AESD_CIRCULAR_BUFFER_FOREACH(entry,buffer,index) {
+	if (entry->buffptr) {
+	    retval += entry->size;
+	}
+    }
+    return retval;
+}
