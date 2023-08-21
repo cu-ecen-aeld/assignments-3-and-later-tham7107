@@ -242,12 +242,10 @@ int send_data_file_to_client(int file_fd, int conn_fd, char * buf)
     // or some positive number if seek ends elsewhere.
     // Since the file is opened with O_APPEND, writes atomically
     // set the file pointer to the end before the write.
-#ifndef USE_AESD_CHAR_DEVICE
     if (lseek(file_fd, 0, SEEK_SET)) {
 	perror("lseek");
 	return (-1);
     }
-#endif // USE_AESD_CHAR_DEVICE
 
     while ((bytes_read = read(file_fd, buf, SOCK_READ_BUF_SIZE))) {
 	if (-1 == bytes_read) {
