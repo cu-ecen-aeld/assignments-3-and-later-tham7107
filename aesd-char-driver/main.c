@@ -53,6 +53,26 @@ int aesd_release(struct inode *inode, struct file *filp)
     return 0;
 }
 
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+{
+    struct aesd_dev *p_aesd_dev = (struct aesd_dev *) filp->private_data;
+    loff_t size = 0;
+    loff_t retval = -EINVAL;
+
+    PDEBUG("aesd_llseek: offset = %lld, whence = %d", offset, whence);
+    // Returns 0 if lock aquired, -EINTR if interrupted. Probably don't
+    // need to lock the ENTIRE function body.
+    if (mutex_lock_interruptible(&aesd_device.lock)) {
+	return -EINTR;
+    }
+    size = aesd_circular_buffer_size(&(p_aesd_dev->circ_buf));
+    retval = fixed_size_llseek(filp, offset, whence, size);
+    mutex_unlock(&aesd_device.lock);
+
+    PDEBUG("aesd_llseek: size = %lld",size);
+    return retval;
+}
+
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
@@ -79,13 +99,11 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
 							*f_pos,
 							&cir_buf_entry_offset);
     // If NULL, gone past end of circular buffer, no more data to read.
-    // Return 0 to indicate EOF.  Also reset f_pos to 0 so next reads
-    // starts at begining of the circular buffer; ie, each new read should
-    // return to start of buffer - implicit seek(fd,0,seek_set)
-    // May need to revisit this when we add seek support in assignment 9?
+    // Return 0 to indicate EOF.  Remove reset f_pos to 0 now that we
+    // have llseek() support.
     if (!p_cir_buf_entry) {
-	*f_pos = 0;
 	mutex_unlock(&aesd_device.lock);
+	PDEBUG("read at EOF, retval 0");
 	return 0;
     }
 
@@ -172,6 +190,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 
     // copy_from_user returns number of bytes NOT copied, 0 on success
     retval = count - copy_from_user(kmem_buf, buf, count);
+    *f_pos += retval;
     p_aesd_dev->partial_write.size += retval;
 
     if ('\n' == *((char *)kmem_buf+(retval-1))) {
@@ -192,6 +211,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 }
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
+    .llseek =   aesd_llseek,
     .read =     aesd_read,
     .write =    aesd_write,
     .open =     aesd_open,
