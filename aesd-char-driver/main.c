@@ -19,6 +19,7 @@
 #include <linux/fs.h> // file_operations
 #include <linux/slab.h> // kmalloc/free
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -209,13 +210,107 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     mutex_unlock(&aesd_device.lock);
     return retval;
 }
+
+/*
+ * Adjust the file offset (f_pos) parameter of @param filp based on the location
+ * specified by @param write_cmd (the zero referenced command to locate) and
+ * @param write_cmd_offset (the zero referenced offset into the command)
+ * @return 0 if successful, negative if error occurred:
+ *   -ERESTARTSYS if mutex could not be obtained
+ *   -EINVAL if write_cmd or write_cmd_offset was out of range or invalid
+ *
+ * Static, as it is only intended to be from aesd_unlocked_ioctl, below.
+ */
+static long aesd_adjust_file_offset(struct file *filp, uint32_t write_cmd,
+			     uint32_t write_cmd_offset)
+{
+    uint8_t index;
+    struct aesd_buffer_entry *entry;
+    long retval = -EINVAL;
+    loff_t byte_count = 0;
+
+    PDEBUG("aesd_adjust_file_offset(), write_cmd=%d, write_cmd_offset=%d",
+	   write_cmd, write_cmd_offset);
+
+    if (write_cmd >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
+	return -EINVAL;
+    }
+
+    // Returns 0 if lock aquired, -EINTR if interrupted. Probably don't
+    // need to lock the ENTIRE function body.
+    if (mutex_lock_interruptible(&aesd_device.lock)) {
+	return -EINTR;
+    }
+
+    AESD_CIRCULAR_BUFFER_FOREACH(entry,&aesd_device.circ_buf,index) {
+	// Since we already checked for out of range write_cmd, this will exit
+	if (index == write_cmd) {
+	    break;
+	} else if (entry->buffptr) {
+	    byte_count += entry->size;
+	}
+    }
+
+    // index is now == write_cmd, buffer is 
+    PDEBUG("aesd_adjust_file_offset(), byte_count=%lld, index=%d, entry=%p",
+	   byte_count, index, entry);
+    if ((!(entry->buffptr)) || (write_cmd_offset >= entry->size)) {
+	retval = -EINVAL;
+    } else {
+	byte_count += write_cmd_offset;
+	PDEBUG("aesd_adjust_file_offset(), final byte_count=%lld", byte_count);
+	PDEBUG("aesd_adjust_file_offset(), change filp->f_pos from %lld to %lld",
+	       filp->f_pos, byte_count);
+	filp->f_pos = byte_count;
+	retval = 0;
+    }
+
+    mutex_unlock(&aesd_device.lock);
+    return retval;
+}
+
+/*
+ * Handle ioctl's.  Only AESDCHAR_IOCSEEKTO is supported.  @param arg is a user
+ * space pointer to a struct aesd_seekto.
+ * @return 0 if successful, negative if error occurred:
+ *   -ERESTARTSYS if mutex could not be obtained
+ *   -EINVAL if write_cmd or write_cmd_offset was out of range or cmd invalid
+ *   -EFAULT if memory pointed to by arg cannot be read.
+ */
+long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    long retval = -EINVAL;
+
+    switch (cmd) {
+    case AESDCHAR_IOCSEEKTO:
+    {
+	struct aesd_seekto seekto;
+	if (copy_from_user(&seekto, (const void __user *)arg,
+			   sizeof(seekto)) != 0) {
+	    // Lecture slides show "retval = EFAULT;", but should be negative
+	    retval = -EFAULT;
+	} else {
+	    retval = aesd_adjust_file_offset(filp, seekto.write_cmd,
+					     seekto.write_cmd_offset);
+	}
+	break;
+    }
+    default:
+	retval = -EINVAL;
+	break;
+    }
+
+    return retval;
+}
+
 struct file_operations aesd_fops = {
-    .owner =    THIS_MODULE,
-    .llseek =   aesd_llseek,
-    .read =     aesd_read,
-    .write =    aesd_write,
-    .open =     aesd_open,
-    .release =  aesd_release,
+    .owner          = THIS_MODULE,
+    .llseek         = aesd_llseek,
+    .read           = aesd_read,
+    .write          = aesd_write,
+    .unlocked_ioctl = aesd_unlocked_ioctl,
+    .open           = aesd_open,
+    .release        = aesd_release,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
