@@ -25,7 +25,7 @@
 #include <pthread.h>
 #include <sys/queue.h>
 #include <time.h>
-#include "aesd_ioctl.h"
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 //#define DEBUG 1
 #undef DEBUG
