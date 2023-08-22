@@ -25,6 +25,7 @@
 #include <pthread.h>
 #include <sys/queue.h>
 #include <time.h>
+#include "aesd_ioctl.h"
 
 //#define DEBUG 1
 #undef DEBUG
@@ -47,6 +48,11 @@
 #define DATAFILE_MODE		(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 #endif // USE_AESD_CHAR_DEVICE
 #define TIMESTAMP_DELAY_SECS	10
+
+// Not a #def, since that would create multiple static strings on each
+// reference.  Need to use the same one for strchr ptr math to work.
+const char *IOCSEEKTO_CMD_STR = "AESDCHAR_IOCSEEKTO:%d,%d";
+#define IOCSEEKTO_CMD_STRLEN	(strchr(IOCSEEKTO_CMD_STR,':')-IOCSEEKTO_CMD_STR)
 
 #ifdef DEBUG
 #define PRINTF(...) printf(__VA_ARGS__)
@@ -213,39 +219,57 @@ int wait_for_client_connection(int sock_fd, char *client_ip_addr_str,
     return(conn_fd);
 }
 
-int write_data_file(int fd, char * buf, int size)
+int write_data_to_file(char * buf, int size)
 {
+    int file_fd;
+
+    file_fd = open(DATAFILE_NAME, DATAFILE_FLAGS, DATAFILE_MODE);
+    if (-1 == file_fd) {
+	perror("open");
+	return -1;
+    }
+
     // Write up to (but NOT including) the newline (or '\0')
     // pointed to by newline_ptr.  Ignore partial writes (fs full)
-    if (-1 == write(fd, buf, size)) {
+    if (-1 == write(file_fd, buf, size)) {
 	perror("write");
 	return (-1);
     }
+
     // Now write out a trailing newline.  Done separately instead
     // of writing +1 above, in case we didn't get a newline in the
     // received packet (which shouldn't happen, since the
     // assignment says we always get newline
     buf[0] = '\n';
-    if (-1 == write(fd, buf, 1)) {
+    if (-1 == write(file_fd, buf, 1)) {
 	perror("write");
 	return (-1);
     }
+
+    if (-1 == close(file_fd)) {
+	perror("close");
+	return (-1);
+    }
+
     return 0;
 }
 
-int send_data_file_to_client(int file_fd, int conn_fd, char * buf)
+int send_data_file_to_client(int conn_fd, char * buf, uint32_t
+			     write_cmd, uint32_t write_cmd_offset)
 {
+    int file_fd;
+    struct aesd_seekto seekto;
     int bytes_read;
 
-    // Reset file pointer to start.  Should return 0 (requested
-    // set point).  Non-zero is an error (either -1 for error
-    // or some positive number if seek ends elsewhere.
-    // Since the file is opened with O_APPEND, writes atomically
-    // set the file pointer to the end before the write.
-    if (lseek(file_fd, 0, SEEK_SET)) {
-	perror("lseek");
-	return (-1);
+    file_fd = open(DATAFILE_NAME, DATAFILE_FLAGS, DATAFILE_MODE);
+    if (-1 == file_fd) {
+	perror("open");
+	return -1;
     }
+
+    seekto.write_cmd = write_cmd;
+    seekto.write_cmd_offset = write_cmd_offset;
+    ioctl(file_fd, AESDCHAR_IOCSEEKTO, &seekto);
 
     while ((bytes_read = read(file_fd, buf, SOCK_READ_BUF_SIZE))) {
 	if (-1 == bytes_read) {
@@ -259,6 +283,12 @@ int send_data_file_to_client(int file_fd, int conn_fd, char * buf)
 	    return (-1);
 	}
     }
+
+    if (-1 == close(file_fd)) {
+	perror("close");
+	return (-1);
+    }
+
     return 0;
 }
 
@@ -274,7 +304,7 @@ void *server_thread(void *arg)
     int cur_buf_size;
     int bytes_read;
     char *newline_ptr;
-    int file_fd;
+    uint32_t write_cmd, write_cmd_offset;
 
     // Block SIGINT and SIGTERM - let main thread handle them.
     sigemptyset(&signal_set);
@@ -341,28 +371,28 @@ void *server_thread(void *arg)
 		pthread_exit(p_thread_data);
 	    }
 	    
-
-	    if (-1 == (file_fd = open(DATAFILE_NAME, DATAFILE_FLAGS,
-				      DATAFILE_MODE))) {
-		perror("open");
-		// Things are already broken. Ignore return of unlock
-		(void) pthread_mutex_unlock(p_thread_data->p_file_mutex);
-		free(buf_start);
-		pthread_exit(p_thread_data);
+	    // Check for inline seekto command.  Issue ioctl if found
+	    // (without writing string to file).  If not found, write
+	    // string as normal.
+	    if (!strncmp(IOCSEEKTO_CMD_STR, buf_start,
+			 IOCSEEKTO_CMD_STRLEN)) {
+		// Inline seekto, don't write to file
+		sscanf(buf_start, IOCSEEKTO_CMD_STR, &write_cmd,
+		       &write_cmd_offset);
+	    } else {
+		// Regular data, write it.
+		write_cmd = 0;
+		write_cmd_offset = 0;
+		if (write_data_to_file(buf_start,
+				       newline_ptr - buf_start)) {
+		    (void) pthread_mutex_unlock(p_thread_data->p_file_mutex);
+		    free(buf_start);
+		    pthread_exit(p_thread_data);
+		}
 	    }
 
-	    if (write_data_file(file_fd, buf_start,
-				newline_ptr - buf_start) ||
-		send_data_file_to_client(file_fd,
-					 p_thread_data->conn_fd,
-					 buf_start)) {
-		(void) pthread_mutex_unlock(p_thread_data->p_file_mutex);
-		free(buf_start);
-		pthread_exit(p_thread_data);
-	    }
-
-	    if (-1 == close(file_fd)) {
-		perror("close");
+	    if (send_data_file_to_client(p_thread_data->conn_fd, buf_start,
+					 write_cmd, write_cmd_offset)) {
 		(void) pthread_mutex_unlock(p_thread_data->p_file_mutex);
 		free(buf_start);
 		pthread_exit(p_thread_data);
