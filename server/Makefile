@@ -8,6 +8,7 @@
 CC ?= $(CROSS_COMPILE)gcc
 CFLAGS ?= -Wall -Werror -g
 LDFLAGS ?= -pthread
+CFLAGS += -I../aesd-char-driver
 
 all: aesdsocket
 
